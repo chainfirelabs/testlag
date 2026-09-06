@@ -77,6 +77,14 @@ int main(int argc, char **argv) {
             g_warning("Could not load profile %s: %s", profile_path, err);
         else if (err[0])
             g_warning("Profile %s: %s", profile_path, err);
+        /* The profile says which rules were running when it was saved; the
+         * kernel says which ones still are. Trusting the file would show
+         * rules as active with nothing applied -- and Start is a no-op on an
+         * already-active rule, so they could not be started again. */
+        int stale = tc_sync_active_state(profile);
+        if (stale > 0)
+            g_message("%d rule(s) marked active in %s are no longer applied; "
+                      "marked stopped.", stale, profile_path);
     }
 
     if (cli_argv) {

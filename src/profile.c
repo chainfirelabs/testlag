@@ -4,11 +4,16 @@
  * {
  *   "version": 1,
  *   "rules": [
- *     {"iface":"eth0","ip":"1.2.3.4","port":"443","bandwidth":"100kbit",
- *      "latency_ms":100,"jitter_ms":20,"drop_pct":5,"active":false},
+ *     {"iface":"eth0","src_ip":"","src_port":"80","ip":"1.2.3.4","port":"443",
+ *      "bandwidth":"100kbit","latency_ms":100,"jitter_ms":20,"drop_pct":5,
+ *      "active":false},
  *     ...
  *   ]
  * }
+ *
+ * "ip"/"port" are the destination match, named that way since before source
+ * matching existed; profiles written by older builds load unchanged, with
+ * empty source fields.
  */
 #include "profile.h"
 
@@ -80,8 +85,10 @@ int profile_save(const LagProfile *p, const char *path, char *err, size_t errlen
         const LagRule *r = &p->rules[i];
         g_string_append(s, i ? ",\n    {" : "\n    {");
         g_string_append(s, "\"iface\":");      json_escape(s, r->iface);
-        g_string_append(s, ",\"ip\":");        json_escape(s, r->ip);
-        g_string_append(s, ",\"port\":");      json_escape(s, r->port);
+        g_string_append(s, ",\"src_ip\":");    json_escape(s, r->src_ip);
+        g_string_append(s, ",\"src_port\":");  json_escape(s, r->src_port);
+        g_string_append(s, ",\"ip\":");        json_escape(s, r->dst_ip);
+        g_string_append(s, ",\"port\":");      json_escape(s, r->dst_port);
         g_string_append(s, ",\"bandwidth\":"); json_escape(s, r->bandwidth);
         g_string_append(s, ",\"latency_ms\":"); append_num(s, r->latency_ms);
         g_string_append(s, ",\"jitter_ms\":");  append_num(s, r->jitter_ms);
@@ -248,12 +255,18 @@ static void jp_rule_object(JP *j, LagRule *r) {
         if (g_strcmp0(key, "iface") == 0) {
             char *v = jp_string(j);
             if (v) { g_strlcpy(r->iface, v, LAG_IFACE_LEN); g_free(v); }
+        } else if (g_strcmp0(key, "src_ip") == 0) {
+            char *v = jp_string(j);
+            if (v) { g_strlcpy(r->src_ip, v, LAG_IP_LEN); g_free(v); }
+        } else if (g_strcmp0(key, "src_port") == 0) {
+            char *v = jp_string(j);
+            if (v) { g_strlcpy(r->src_port, v, LAG_PORT_LEN); g_free(v); }
         } else if (g_strcmp0(key, "ip") == 0) {
             char *v = jp_string(j);
-            if (v) { g_strlcpy(r->ip, v, LAG_IP_LEN); g_free(v); }
+            if (v) { g_strlcpy(r->dst_ip, v, LAG_IP_LEN); g_free(v); }
         } else if (g_strcmp0(key, "port") == 0) {
             char *v = jp_string(j);
-            if (v) { g_strlcpy(r->port, v, LAG_PORT_LEN); g_free(v); }
+            if (v) { g_strlcpy(r->dst_port, v, LAG_PORT_LEN); g_free(v); }
         } else if (g_strcmp0(key, "bandwidth") == 0) {
             char *v = jp_string(j);
             if (v) { g_strlcpy(r->bandwidth, v, LAG_BW_LEN); g_free(v); }

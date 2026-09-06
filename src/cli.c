@@ -41,10 +41,13 @@ static void cli_usage(FILE *out) {
         "  status                          Show live tc state for profile interfaces\n"
         "  help                            Show this help\n"
         "\n"
-        "Rule options:\n"
+        "Rule options (a rule matches packets LEAVING the interface, so\n"
+        "source is this machine and destination is the peer):\n"
         "  --iface IFACE     Network interface (required for add; e.g. lo, eth0)\n"
-        "  --ip IP           Destination IP (default: any)\n"
-        "  --port PORT       Destination port (default: any)\n"
+        "  --src-ip IP       Source IP (default: any)\n"
+        "  --src-port PORT   Source port, e.g. 80 for your own web server\n"
+        "  --dst-ip IP       Destination IP (default: any); --ip is an alias\n"
+        "  --dst-port PORT   Destination port (default: any); --port is an alias\n"
         "  --latency MS      Latency in milliseconds, 0-60000 (default: 0)\n"
         "  --jitter MS       Jitter in milliseconds, 0-60000 (default: 0)\n"
         "  --drop PCT        Packet loss percent, 0-100 (default: 0)\n"
@@ -53,8 +56,12 @@ static void cli_usage(FILE *out) {
         "\n"
         "Examples:\n"
         "  testlag list\n"
-        "  testlag add --iface lo --ip 192.168.1.50 --port 443 --latency 150 \\\n"
+        "  testlag add --iface lo --dst-ip 192.168.1.50 --dst-port 443 --latency 150 \\\n"
         "      --jitter 30 --drop 5 --bandwidth 100kbit\n"
+        "  # lag everyone hitting this machine's web server (delays its replies):\n"
+        "  testlag add --iface eth0 --src-port 80 --latency 200\n"
+        "  # lag just one device talking to that web server:\n"
+        "  testlag add --iface eth0 --src-port 80 --dst-ip 192.168.1.77 --latency 200\n"
         "  testlag start 0\n"
         "  testlag stop all\n"
         "  testlag del 2\n");
@@ -73,9 +80,12 @@ gboolean cli_is_command(const char *s) {
 /* ---------------- rule option parsing ---------------- */
 
 typedef struct {
-    gboolean has_iface, has_ip, has_port, has_bw, has_lat, has_jit, has_drop;
+    gboolean has_iface, has_bw, has_lat, has_jit, has_drop;
+    gboolean has_src_ip, has_src_port, has_dst_ip, has_dst_port;
     gboolean active;
-    char     iface[LAG_IFACE_LEN], ip[LAG_IP_LEN], port[LAG_PORT_LEN];
+    char     iface[LAG_IFACE_LEN];
+    char     src_ip[LAG_IP_LEN], src_port[LAG_PORT_LEN];
+    char     dst_ip[LAG_IP_LEN], dst_port[LAG_PORT_LEN];
     char     bw[LAG_BW_LEN];
     double   lat, jit, drop;
 } RuleOpts;
@@ -104,24 +114,42 @@ static int parse_rule_opts(char **argv, RuleOpts *o, char *err, size_t errlen) {
             }
             g_strlcpy(o->iface, argv[i], sizeof o->iface);
             o->has_iface = TRUE;
-        } else if (g_strcmp0(a, "--ip") == 0) {
+        } else if (g_strcmp0(a, "--src-ip") == 0) {
             i++;
-            if (!argv[i]) { g_snprintf(err, errlen, "--ip requires a value"); return -1; }
+            if (!argv[i]) { g_snprintf(err, errlen, "--src-ip requires a value"); return -1; }
             if (!tc_valid_ip(argv[i])) {
-                g_snprintf(err, errlen, "invalid IP address: %s", argv[i]);
+                g_snprintf(err, errlen, "invalid source IP address: %s", argv[i]);
                 return -1;
             }
-            g_strlcpy(o->ip, argv[i], sizeof o->ip);
-            o->has_ip = TRUE;
-        } else if (g_strcmp0(a, "--port") == 0) {
+            g_strlcpy(o->src_ip, argv[i], sizeof o->src_ip);
+            o->has_src_ip = TRUE;
+        } else if (g_strcmp0(a, "--src-port") == 0) {
             i++;
-            if (!argv[i]) { g_snprintf(err, errlen, "--port requires a value"); return -1; }
+            if (!argv[i]) { g_snprintf(err, errlen, "--src-port requires a value"); return -1; }
             if (!tc_valid_port(argv[i])) {
-                g_snprintf(err, errlen, "invalid port: %s", argv[i]);
+                g_snprintf(err, errlen, "invalid source port: %s", argv[i]);
                 return -1;
             }
-            g_strlcpy(o->port, argv[i], sizeof o->port);
-            o->has_port = TRUE;
+            g_strlcpy(o->src_port, argv[i], sizeof o->src_port);
+            o->has_src_port = TRUE;
+        } else if (g_strcmp0(a, "--dst-ip") == 0 || g_strcmp0(a, "--ip") == 0) {
+            i++;
+            if (!argv[i]) { g_snprintf(err, errlen, "%s requires a value", a); return -1; }
+            if (!tc_valid_ip(argv[i])) {
+                g_snprintf(err, errlen, "invalid destination IP address: %s", argv[i]);
+                return -1;
+            }
+            g_strlcpy(o->dst_ip, argv[i], sizeof o->dst_ip);
+            o->has_dst_ip = TRUE;
+        } else if (g_strcmp0(a, "--dst-port") == 0 || g_strcmp0(a, "--port") == 0) {
+            i++;
+            if (!argv[i]) { g_snprintf(err, errlen, "%s requires a value", a); return -1; }
+            if (!tc_valid_port(argv[i])) {
+                g_snprintf(err, errlen, "invalid destination port: %s", argv[i]);
+                return -1;
+            }
+            g_strlcpy(o->dst_port, argv[i], sizeof o->dst_port);
+            o->has_dst_port = TRUE;
         } else if (g_strcmp0(a, "--latency") == 0) {
             i++;
             if (!parse_double_opt(argv[i], &o->lat) || !tc_valid_ms(o->lat)) {
@@ -194,15 +222,18 @@ static int cmd_list(LagProfile *p) {
         printf("(no rules in profile)\n");
         return 0;
     }
-    printf(" #  %-8s %-15s %-6s %-9s %-8s %-8s %-12s %s\n",
-           "IFACE", "IP", "PORT", "LAT(ms)", "JIT(ms)", "DROP(%)", "BW", "STATE");
+    printf(" #  %-9s %-15s %-6s %-15s %-6s %-8s %-8s %-8s %-11s %s\n",
+           "IFACE", "SRC IP", "SPORT", "DST IP", "DPORT",
+           "LAT(ms)", "JIT(ms)", "DROP(%)", "BW", "STATE");
     for (int i = 0; i < p->count; i++) {
         const LagRule *r = &p->rules[i];
-        printf("%2d  %-8s %-15s %-6s %-9g %-8g %-8g %-12s %s\n",
+        printf("%2d  %-9s %-15s %-6s %-15s %-6s %-8g %-8g %-8g %-11s %s\n",
                i,
                r->iface,
-               r->ip[0] ? r->ip : "(any)",
-               r->port[0] ? r->port : "(any)",
+               r->src_ip[0] ? r->src_ip : "(any)",
+               r->src_port[0] ? r->src_port : "(any)",
+               r->dst_ip[0] ? r->dst_ip : "(any)",
+               r->dst_port[0] ? r->dst_port : "(any)",
                r->latency_ms, r->jitter_ms, r->drop_pct,
                r->bandwidth[0] ? r->bandwidth : "(unlimited)",
                r->active ? "active" : "stopped");
@@ -237,8 +268,10 @@ static int cmd_add(LagProfile *p, const char *path, char **argv) {
     LagRule r;
     lag_rule_reset(&r);
     g_strlcpy(r.iface, o.iface, sizeof r.iface);
-    if (o.has_ip)   g_strlcpy(r.ip, o.ip, sizeof r.ip);
-    if (o.has_port) g_strlcpy(r.port, o.port, sizeof r.port);
+    if (o.has_src_ip)   g_strlcpy(r.src_ip, o.src_ip, sizeof r.src_ip);
+    if (o.has_src_port) g_strlcpy(r.src_port, o.src_port, sizeof r.src_port);
+    if (o.has_dst_ip)   g_strlcpy(r.dst_ip, o.dst_ip, sizeof r.dst_ip);
+    if (o.has_dst_port) g_strlcpy(r.dst_port, o.dst_port, sizeof r.dst_port);
     if (o.has_bw)   g_strlcpy(r.bandwidth, o.bw, sizeof r.bandwidth);
     if (o.has_lat)  r.latency_ms = o.lat;
     if (o.has_jit)  r.jitter_ms  = o.jit;
@@ -276,8 +309,8 @@ static int cmd_edit(LagProfile *p, const char *path, int idx, char **argv) {
         fprintf(stderr, "error: %s\n", err);
         return 1;
     }
-    if (!o.has_iface && !o.has_ip && !o.has_port && !o.has_bw &&
-        !o.has_lat && !o.has_jit && !o.has_drop) {
+    if (!o.has_iface && !o.has_src_ip && !o.has_src_port && !o.has_dst_ip &&
+        !o.has_dst_port && !o.has_bw && !o.has_lat && !o.has_jit && !o.has_drop) {
         fprintf(stderr, "error: give at least one rule option to change\n");
         return 1;
     }
@@ -285,8 +318,10 @@ static int cmd_edit(LagProfile *p, const char *path, int idx, char **argv) {
     char old_iface[LAG_IFACE_LEN];
     g_strlcpy(old_iface, r->iface, sizeof old_iface);
     if (o.has_iface) g_strlcpy(r->iface, o.iface, sizeof r->iface);
-    if (o.has_ip)    g_strlcpy(r->ip, o.ip, sizeof r->ip);
-    if (o.has_port)  g_strlcpy(r->port, o.port, sizeof r->port);
+    if (o.has_src_ip)   g_strlcpy(r->src_ip, o.src_ip, sizeof r->src_ip);
+    if (o.has_src_port) g_strlcpy(r->src_port, o.src_port, sizeof r->src_port);
+    if (o.has_dst_ip)   g_strlcpy(r->dst_ip, o.dst_ip, sizeof r->dst_ip);
+    if (o.has_dst_port) g_strlcpy(r->dst_port, o.dst_port, sizeof r->dst_port);
     if (o.has_bw)    g_strlcpy(r->bandwidth, o.bw, sizeof r->bandwidth);
     if (o.has_lat)   r->latency_ms = o.lat;
     if (o.has_jit)   r->jitter_ms  = o.jit;
@@ -333,6 +368,72 @@ static int cmd_del(LagProfile *p, const char *path, int idx) {
     return 0;
 }
 
+/* Start or stop every rule in the profile.
+ *
+ * tc_apply_interface() rebuilds an interface's whole qdisc tree from all of
+ * its active rules, so the flags are flipped first and each interface is
+ * converged exactly once. Doing it a rule at a time rebuilt the tree once per
+ * rule -- quadratic in the rule count -- and unprivileged every tc command in
+ * every rebuild is a separate sudo invocation, i.e. a separate PAM/logind
+ * session. Forty rules cost ~2700 processes that way, enough to run the
+ * machine out of file descriptors.
+ * Returns 0 on success, 1 if any interface failed. */
+static int start_stop_all(LagProfile *p, gboolean start) {
+    gboolean saved[LAG_MAX_RULES];
+    int changed = 0;
+    for (int i = 0; i < p->count; i++) {
+        saved[i] = p->rules[i].active;
+        if (p->rules[i].active != start) {
+            p->rules[i].active = start;
+            changed++;
+        }
+    }
+    if (!changed) {
+        printf("no rules to %s\n", start ? "start" : "stop");
+        return 0;
+    }
+
+    /* For a stop the rules are already inactive, so the interfaces to converge
+       are the ones that were active a moment ago: take the list from the flags
+       we saved, not from the current ones. */
+    GPtrArray *ifs;
+    if (start) {
+        ifs = tc_profile_ifaces(p, TRUE);
+    } else {
+        for (int i = 0; i < p->count; i++)
+            p->rules[i].active = saved[i];
+        ifs = tc_profile_ifaces(p, TRUE);
+        for (int i = 0; i < p->count; i++)
+            p->rules[i].active = FALSE;
+    }
+
+    int rc = 0;
+    for (guint k = 0; k < ifs->len; k++) {
+        const char *iface = g_ptr_array_index(ifs, k);
+        char terr[2048];
+        if (tc_apply_interface(p, iface, terr, sizeof terr) == 0) {
+            printf("%s all rules on %s\n", start ? "started" : "stopped", iface);
+            continue;
+        }
+        if (!start) {
+            fprintf(stderr, "warning: stop on %s: %s\n", iface, terr);
+            continue;
+        }
+        rc = 1;
+        fprintf(stderr, "error: start on %s failed: %s\n", iface, terr);
+        /* Roll this interface back to the state it was in and re-converge, so
+           a failure here leaves the rules that were already running alone. */
+        for (int i = 0; i < p->count; i++)
+            if (g_strcmp0(p->rules[i].iface, iface) == 0)
+                p->rules[i].active = saved[i];
+        char rerr[2048];
+        if (tc_apply_interface(p, iface, rerr, sizeof rerr) != 0)
+            fprintf(stderr, "warning: could not restore %s: %s\n", iface, rerr);
+    }
+    g_ptr_array_free(ifs, TRUE);
+    return rc;
+}
+
 static int cmd_start(LagProfile *p, const char *path, const char *target) {
     if (g_strcmp0(target, "all") != 0) {
         char err[512];
@@ -358,22 +459,7 @@ static int cmd_start(LagProfile *p, const char *path, const char *target) {
             return 1;
         return 0;
     }
-    int rc = 0;
-    for (int i = 0; i < p->count; i++) {
-        LagRule *r = &p->rules[i];
-        if (r->active)
-            continue;
-        r->active = TRUE;
-        char terr[2048];
-        if (tc_apply_interface(p, r->iface, terr, sizeof terr) != 0) {
-            r->active = FALSE;
-            fprintf(stderr, "error: start rule %d on %s failed: %s\n",
-                    i, r->iface, terr);
-            rc = 1;
-        } else {
-            printf("started rule %d on %s\n", i, r->iface);
-        }
-    }
+    int rc = start_stop_all(p, TRUE);
     if (save_profile(p, path) != 0)
         rc = 1;
     return rc;
@@ -402,18 +488,7 @@ static int cmd_stop(LagProfile *p, const char *path, const char *target) {
             return 1;
         return 0;
     }
-    int rc = 0;
-    for (int i = 0; i < p->count; i++) {
-        LagRule *r = &p->rules[i];
-        if (!r->active)
-            continue;
-        r->active = FALSE;
-        char terr[2048];
-        if (tc_apply_interface(p, r->iface, terr, sizeof terr) != 0)
-            fprintf(stderr, "warning: stop rule %d on %s: %s\n", i, r->iface, terr);
-        else
-            printf("stopped rule %d on %s\n", i, r->iface);
-    }
+    int rc = start_stop_all(p, FALSE);
     if (save_profile(p, path) != 0)
         rc = 1;
     return rc;

@@ -16,14 +16,20 @@
 #define LAG_CLASS_RATE  "100gbit"
 
 /* One shaping rule.
- * Empty ip AND empty port  =>  apply to ALL traffic on the interface.
- * ip only                   =>  match destination IP.
- * port only                 =>  match destination port (IPv4).
- * ip + port                 =>  match destination IP and port. */
+ *
+ * netem shapes EGRESS, so a rule always describes a packet *leaving* the
+ * interface: "source" is this machine, "destination" is the peer. A reply
+ * from a local service therefore matches on source (src_port 80 = "traffic
+ * my web server sends"); a request this machine makes matches on destination.
+ *
+ * Every field left empty is a wildcard, and a rule with all four empty
+ * applies to ALL traffic on the interface. */
 typedef struct {
     char   iface[LAG_IFACE_LEN];
-    char   ip[LAG_IP_LEN];        /* "" = any */
-    char   port[LAG_PORT_LEN];    /* "" = any (IPv4 dport) */
+    char   src_ip[LAG_IP_LEN];      /* "" = any */
+    char   src_port[LAG_PORT_LEN];  /* "" = any (IPv4 sport) */
+    char   dst_ip[LAG_IP_LEN];      /* "" = any */
+    char   dst_port[LAG_PORT_LEN];  /* "" = any (IPv4 dport) */
     char   bandwidth[LAG_BW_LEN]; /* "" = unlimited, else netem rate e.g. "100kbit" */
     double latency_ms;
     double jitter_ms;
@@ -38,8 +44,10 @@ typedef struct {
 
 static inline void lag_rule_reset(LagRule *r) {
     g_strlcpy(r->iface, "", LAG_IFACE_LEN);
-    g_strlcpy(r->ip, "", LAG_IP_LEN);
-    g_strlcpy(r->port, "", LAG_PORT_LEN);
+    g_strlcpy(r->src_ip, "", LAG_IP_LEN);
+    g_strlcpy(r->src_port, "", LAG_PORT_LEN);
+    g_strlcpy(r->dst_ip, "", LAG_IP_LEN);
+    g_strlcpy(r->dst_port, "", LAG_PORT_LEN);
     g_strlcpy(r->bandwidth, "", LAG_BW_LEN);
     r->latency_ms = 0.0;
     r->jitter_ms  = 0.0;
@@ -47,9 +55,10 @@ static inline void lag_rule_reset(LagRule *r) {
     r->active     = FALSE;
 }
 
-/* True if the rule applies to all traffic (no ip, no port). */
+/* True if the rule applies to all traffic (no source or destination match). */
 static inline gboolean lag_rule_is_all(const LagRule *r) {
-    return r->ip[0] == '\0' && r->port[0] == '\0';
+    return r->src_ip[0] == '\0' && r->src_port[0] == '\0' &&
+           r->dst_ip[0] == '\0' && r->dst_port[0] == '\0';
 }
 
 #endif /* LAG_H */

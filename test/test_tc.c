@@ -68,8 +68,8 @@ int main(void) {
     profile_clear(&p);
     LagRule *r1 = &p.rules[p.count++];
     g_strlcpy(r1->iface, "lo", sizeof r1->iface);
-    g_strlcpy(r1->ip, "127.0.0.1", sizeof r1->ip);
-    g_strlcpy(r1->port, "443", sizeof r1->port);
+    g_strlcpy(r1->dst_ip, "127.0.0.1", sizeof r1->dst_ip);
+    g_strlcpy(r1->dst_port, "443", sizeof r1->dst_port);
     g_strlcpy(r1->bandwidth, "100kbit", sizeof r1->bandwidth);
     r1->latency_ms = 100; r1->jitter_ms = 20; r1->drop_pct = 5;
 
@@ -102,6 +102,60 @@ int main(void) {
     g_free(filt);
 
     CHECK(tc_build_filter(r2, "lo", 1) == NULL, "all-traffic has no filter");
+
+    /* ---- source matching ----
+     * netem shapes egress, so "lag whoever talks to my web server" is
+     * expressed as its replies: source port 80, any destination. */
+    LagRule srv;
+    lag_rule_reset(&srv);
+    g_strlcpy(srv.iface, "lo", sizeof srv.iface);
+    g_strlcpy(srv.src_port, "80", sizeof srv.src_port);
+    srv.latency_ms = 200;
+    CHECK(!lag_rule_is_all(&srv), "a source-only rule is not an all-traffic rule");
+    CHECK(tc_valid_rule(&srv, verr, sizeof verr), "source-only rule validates (%s)", verr);
+    char *sfilt = tc_build_filter(&srv, "lo", 2);
+    printf("filter src-only: %s\n", sfilt);
+    CHECK(sfilt && strstr(sfilt, "match ip sport 80 0xffff") != NULL, "filter sport");
+    CHECK(sfilt && strstr(sfilt, "dport") == NULL, "source-only rule has no dport match");
+    g_free(sfilt);
+
+    /* one device talking to that service: its replies, aimed at that device */
+    g_strlcpy(srv.dst_ip, "192.168.1.77", sizeof srv.dst_ip);
+    sfilt = tc_build_filter(&srv, "lo", 3);
+    printf("filter src+dst : %s\n", sfilt);
+    CHECK(sfilt && strstr(sfilt, "match ip dst 192.168.1.77/32") != NULL, "filter src+dst: dst");
+    CHECK(sfilt && strstr(sfilt, "match ip sport 80 0xffff") != NULL, "filter src+dst: sport");
+    g_free(sfilt);
+
+    /* full four-tuple, and the v4/v6 mixing guard */
+    LagRule four;
+    lag_rule_reset(&four);
+    g_strlcpy(four.iface, "lo", sizeof four.iface);
+    g_strlcpy(four.src_ip, "10.0.0.1", sizeof four.src_ip);
+    g_strlcpy(four.src_port, "80", sizeof four.src_port);
+    g_strlcpy(four.dst_ip, "10.0.0.2", sizeof four.dst_ip);
+    g_strlcpy(four.dst_port, "9000", sizeof four.dst_port);
+    four.latency_ms = 10;
+    sfilt = tc_build_filter(&four, "lo", 4);
+    printf("filter 4-tuple : %s\n", sfilt);
+    CHECK(sfilt && strstr(sfilt, "match ip src 10.0.0.1/32") &&
+          strstr(sfilt, "match ip dst 10.0.0.2/32") &&
+          strstr(sfilt, "match ip sport 80 0xffff") &&
+          strstr(sfilt, "match ip dport 9000 0xffff"), "filter carries all four matches");
+    g_free(sfilt);
+    g_strlcpy(four.dst_ip, "2001:db8::1", sizeof four.dst_ip);
+    CHECK(!tc_valid_rule(&four, verr, sizeof verr), "rejects a rule mixing IPv4 and IPv6");
+
+    LagRule v6;
+    lag_rule_reset(&v6);
+    g_strlcpy(v6.iface, "lo", sizeof v6.iface);
+    g_strlcpy(v6.src_ip, "2001:db8::1", sizeof v6.src_ip);
+    v6.latency_ms = 10;
+    sfilt = tc_build_filter(&v6, "lo", 5);
+    printf("filter v6 src  : %s\n", sfilt);
+    CHECK(sfilt && strstr(sfilt, "protocol ipv6") && strstr(sfilt, "match ip6 src 2001:db8::1"),
+          "IPv6 source match");
+    g_free(sfilt);
 
     /* ---- apply both active ---- */
     char err[2048];
@@ -165,6 +219,71 @@ int main(void) {
     CHECK(strstr(state, "netem") == NULL, "specific-only: cleared");
     g_free(state);
 
+    /* ---- batch mode ----
+     * The whole tree is applied by one tc process: unprivileged, each command
+     * run separately was its own sudo, i.e. its own PAM/logind session. */
+    const char *batch_ok[] = {
+        "qdisc add dev lo root handle 1: htb default 1",
+        "class add dev lo parent 1: classid 1:1 htb rate 100gbit ceil 100gbit",
+        "qdisc add dev lo parent 1:1 netem delay 42ms",
+    };
+    char bout[4096];
+    CHECK(tc_run_batch(batch_ok, 3, bout, sizeof bout) == 0, "batch applies a whole tree");
+    state = tc_get_state_text("lo");
+    CHECK(strstr(state, "42ms") != NULL, "batch: the tree is really there");
+    g_free(state);
+    const char *batch_bad[] = { "qdisc add dev lo parent 1:99 netem delay 1ms" };
+    CHECK(tc_run_batch(batch_bad, 1, bout, sizeof bout) != 0, "batch reports a failed command");
+    /* a newline would open a batch line of its own: refused before any exec */
+    const char *batch_inj[] = { "qdisc show dev lo\nqdisc del dev lo root" };
+    CHECK(tc_run_batch(batch_inj, 1, bout, sizeof bout) == -1, "batch rejects an embedded newline");
+    state = tc_get_state_text("lo");
+    CHECK(strstr(state, "42ms") != NULL, "batch: the injected del did not run");
+    g_free(state);
+    CHECK(tc_clear_interface("lo", err, sizeof err) == 0, "batch: clear");
+
+    /* ---- interface list: the unit of work for a bulk start/stop ----
+     * start/stop all must converge each interface once, not once per rule;
+     * per-rule rebuilds are quadratic and every tc command is its own sudo. */
+    r1->active = TRUE;
+    r2->active = TRUE;
+    GPtrArray *pifs = tc_profile_ifaces(&p, TRUE);
+    CHECK(pifs->len == 1, "two rules on one interface list it once (got %u)", pifs->len);
+    CHECK(pifs->len == 1 &&
+          g_strcmp0((const char *)g_ptr_array_index(pifs, 0), "lo") == 0,
+          "profile interface is lo");
+    g_ptr_array_free(pifs, TRUE);
+    r1->active = FALSE;
+    r2->active = FALSE;
+    pifs = tc_profile_ifaces(&p, TRUE);
+    CHECK(pifs->len == 0, "no active rules, no interfaces to converge");
+    g_ptr_array_free(pifs, TRUE);
+    pifs = tc_profile_ifaces(&p, FALSE);
+    CHECK(pifs->len == 1, "inactive rules still name their interface");
+    g_ptr_array_free(pifs, TRUE);
+
+    /* ---- active-state reconciliation ----
+     * A profile carries the `active` flags it was saved with, but tc state
+     * lives in the kernel: after a reboot the flags are stale. Loading them
+     * as-is showed rules as active with nothing applied, and Start is a no-op
+     * on an already-active rule, so latency changes did nothing. */
+    r1->active = TRUE;
+    r2->active = TRUE;
+    int stale = tc_sync_active_state(&p);   /* lo is clean at this point */
+    CHECK(stale == 2, "sync clears flags when the interface is not shaped (got %d)", stale);
+    CHECK(!r1->active && !r2->active, "sync: both rules marked stopped");
+
+    r2->active = TRUE;                      /* all-traffic rule, really applied */
+    rc = tc_apply_interface(&p, "lo", err, sizeof err);
+    CHECK(rc == 0, "sync: re-apply for the live-state check (%s)", err);
+    r1->active = TRUE;                      /* flag set without re-applying */
+    CHECK(tc_sync_active_state(&p) == 0, "sync keeps flags while we are shaping");
+    CHECK(r1->active && r2->active, "sync: live rules stay active");
+    r1->active = FALSE;
+    r2->active = FALSE;
+    rc = tc_apply_interface(&p, "lo", err, sizeof err);
+    CHECK(rc == 0, "sync: clear after the live-state check");
+
     /* ---- profile round-trip ---- */
     const char *path = "/tmp/lag_test_profile.json";
     unlink(path);
@@ -186,13 +305,13 @@ int main(void) {
     CHECK(p2.count == 2, "loaded %d rules (want 2)", p2.count);
     if (p2.count == 2) {
         CHECK(g_strcmp0(p2.rules[0].iface, "lo") == 0, "rt iface");
-        CHECK(g_strcmp0(p2.rules[0].ip, "127.0.0.1") == 0, "rt ip");
-        CHECK(g_strcmp0(p2.rules[0].port, "443") == 0, "rt port");
+        CHECK(g_strcmp0(p2.rules[0].dst_ip, "127.0.0.1") == 0, "rt ip");
+        CHECK(g_strcmp0(p2.rules[0].dst_port, "443") == 0, "rt port");
         CHECK(g_strcmp0(p2.rules[0].bandwidth, "100kbit") == 0, "rt bandwidth");
         CHECK(p2.rules[0].latency_ms == 100.0, "rt latency");
         CHECK(p2.rules[0].jitter_ms == 20.0, "rt jitter");
         CHECK(p2.rules[0].drop_pct == 5.0, "rt drop");
-        CHECK(p2.rules[1].ip[0] == '\0' && p2.rules[1].port[0] == '\0',
+        CHECK(p2.rules[1].dst_ip[0] == '\0' && p2.rules[1].dst_port[0] == '\0',
               "rt all-traffic rule");
         CHECK(p2.rules[1].latency_ms == 300.0, "rt all-traffic latency");
     }

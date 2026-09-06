@@ -19,6 +19,8 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <math.h>
 #include <stdio.h>
@@ -151,6 +153,137 @@ int tc_run(const char *cmd, gboolean needs_priv, char *out, size_t outlen) {
     return status;
 }
 
+/* Read a pipe to EOF. Newly allocated, never NULL. */
+static char *read_all(int fd) {
+    GString *s = g_string_new("");
+    char buf[4096];
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n > 0)       g_string_append_len(s, buf, n);
+        else if (n == 0) break;
+        else if (errno != EINTR) break;
+    }
+    return g_string_free(s, FALSE);
+}
+
+/* Largest batch we will hand to tc in one write. The whole batch is written
+ * before the child's output is read, so it has to fit in the pipe buffer
+ * (64 KiB on Linux) or writer and reader could deadlock. LAG_MAX_RULES rules
+ * come to well under this; the check is here so that stops being true loudly
+ * rather than by hanging. */
+#define TC_BATCH_MAX 32768
+
+/* Run several tc commands in a single privileged process.
+ *
+ * Building an interface takes seven to ten tc commands. Running them one at a
+ * time meant, unprivileged, seven to ten separate sudo invocations -- and
+ * every sudo is a PAM/logind session, which in bulk is enough to run a machine
+ * out of file descriptors. tc's batch mode takes the same commands on stdin
+ * and applies them in one process, so an apply costs one privilege transition.
+ *
+ * No shell is involved here either: the batch is data on the child's stdin,
+ * never a command line, and every value in it comes from the validators above
+ * -- none of which admit a newline, so a value cannot open a line of its own.
+ * The newline check below is a second lock on that door. */
+int tc_run_batch(const char *const *lines, int n, char *out, size_t outlen) {
+    if (out && outlen) out[0] = '\0';
+    if (!lines || n <= 0) return -1;
+
+    GString *batch = g_string_new("");
+    for (int i = 0; i < n; i++) {
+        if (!lines[i] || !*lines[i] || strpbrk(lines[i], "\n\r")) {
+            if (out && outlen) g_strlcpy(out, "malformed tc batch line", outlen);
+            g_string_free(batch, TRUE);
+            return -1;
+        }
+        g_string_append(batch, lines[i]);
+        g_string_append_c(batch, '\n');
+    }
+    if (batch->len > TC_BATCH_MAX) {
+        if (out && outlen) g_strlcpy(out, "tc batch too large", outlen);
+        g_string_free(batch, TRUE);
+        return -1;
+    }
+
+    char *prog = resolve_program("tc");
+    if (!prog) {
+        if (out && outlen) g_strlcpy(out, "tc: command not found", outlen);
+        g_string_free(batch, TRUE);
+        return -1;
+    }
+    GPtrArray *argv = g_ptr_array_new_with_free_func(g_free);
+    if (!tc_is_root() && g_use_sudo) {
+        char *sudo = resolve_program("sudo");
+        if (!sudo) {
+            if (out && outlen) g_strlcpy(out, "sudo: command not found", outlen);
+            g_free(prog);
+            g_ptr_array_free(argv, TRUE);
+            g_string_free(batch, TRUE);
+            return -1;
+        }
+        g_ptr_array_add(argv, sudo);
+    }
+    g_ptr_array_add(argv, prog);
+    g_ptr_array_add(argv, g_strdup("-batch"));
+    g_ptr_array_add(argv, g_strdup("-"));      /* read the batch from stdin */
+    g_ptr_array_add(argv, NULL);
+
+    char **envp = child_envp();
+    GPid pid = 0;
+    int in_fd = -1, out_fd = -1, err_fd = -1;
+    GError *gerr = NULL;
+    /* sudo reads a password from /dev/tty, not stdin, so handing the child a
+       pipe on stdin does not stop it prompting. */
+    gboolean ok = g_spawn_async_with_pipes(NULL, (char **)argv->pdata, envp,
+        G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &pid,
+        &in_fd, &out_fd, &err_fd, &gerr);
+    if (!ok) {
+        if (out && outlen)
+            g_snprintf(out, outlen, "%s",
+                       gerr ? gerr->message : "could not run tc");
+        g_clear_error(&gerr);
+        g_strfreev(envp);
+        g_ptr_array_free(argv, TRUE);
+        g_string_free(batch, TRUE);
+        return -1;
+    }
+
+    /* A child that dies before reading the batch must not take us with it. */
+    void (*old_pipe)(int) = signal(SIGPIPE, SIG_IGN);
+    const char *w = batch->str;
+    gsize left = batch->len;
+    while (left > 0) {
+        ssize_t n = write(in_fd, w, left);
+        if (n > 0) { w += n; left -= (gsize)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        break;                              /* child gone: its status tells us */
+    }
+    close(in_fd);
+    signal(SIGPIPE, old_pipe);
+
+    char *sout = read_all(out_fd);
+    char *serr = read_all(err_fd);
+    close(out_fd);
+    close(err_fd);
+    if (out && outlen) {
+        g_strlcpy(out, sout, outlen);
+        if (*serr) g_strlcat(out, serr, outlen);
+    }
+    g_free(sout);
+    g_free(serr);
+
+    int wstatus = 0, status;
+    pid_t got;
+    do { got = waitpid((pid_t)pid, &wstatus, 0); } while (got < 0 && errno == EINTR);
+    status = (got == (pid_t)pid && WIFEXITED(wstatus)) ? WEXITSTATUS(wstatus) : -1;
+    g_spawn_close_pid(pid);
+
+    g_strfreev(envp);
+    g_ptr_array_free(argv, TRUE);
+    g_string_free(batch, TRUE);
+    return status;
+}
+
 gboolean tc_sudo_present(void) {
     char *p = resolve_program("sudo");
     gboolean found = (p != NULL);
@@ -164,6 +297,12 @@ gboolean tc_sudo_present(void) {
  * of defence any more; they exist to keep malformed values (from a profile
  * file, the CLI, or the GUI) from reaching tc at all. Every rule that is
  * loaded or applied goes through tc_valid_rule(). */
+
+/* An address is IPv6 if it carries a colon; a rule is IPv6 if either of its
+ * addresses is (tc_valid_rule rejects a rule that mixes the two families). */
+static gboolean ip_is_v6(const char *s) {
+    return s[0] != '\0' && strchr(s, ':') != NULL;
+}
 
 gboolean tc_valid_iface(const char *s) {
     if (!s || !*s) return FALSE;
@@ -238,10 +377,20 @@ gboolean tc_valid_rule(const LagRule *r, char *err, size_t errlen) {
         return rule_err(err, errlen, "no rule");
     if (!tc_valid_iface(r->iface))
         return rule_err(err, errlen, "invalid interface name: %s", r->iface);
-    if (r->ip[0] && !tc_valid_ip(r->ip))
-        return rule_err(err, errlen, "invalid IP address: %s", r->ip);
-    if (r->port[0] && !tc_valid_port(r->port))
-        return rule_err(err, errlen, "invalid port: %s", r->port);
+    if (r->src_ip[0] && !tc_valid_ip(r->src_ip))
+        return rule_err(err, errlen, "invalid source IP address: %s", r->src_ip);
+    if (r->dst_ip[0] && !tc_valid_ip(r->dst_ip))
+        return rule_err(err, errlen, "invalid destination IP address: %s", r->dst_ip);
+    if (r->src_port[0] && !tc_valid_port(r->src_port))
+        return rule_err(err, errlen, "invalid source port: %s", r->src_port);
+    if (r->dst_port[0] && !tc_valid_port(r->dst_port))
+        return rule_err(err, errlen, "invalid destination port: %s", r->dst_port);
+    /* One u32 filter matches one protocol: a rule cannot straddle v4 and v6. */
+    if (r->src_ip[0] && r->dst_ip[0] &&
+        ip_is_v6(r->src_ip) != ip_is_v6(r->dst_ip))
+        return rule_err(err, errlen,
+            "source and destination must be the same IP version (%s / %s)",
+            r->src_ip, r->dst_ip);
     if (r->bandwidth[0] && !tc_valid_rate(r->bandwidth))
         return rule_err(err, errlen, "invalid bandwidth: %s", r->bandwidth);
     if (!tc_valid_ms(r->latency_ms))
@@ -281,7 +430,15 @@ GPtrArray *tc_list_interfaces(void) {
 
 /* ---------------- state inspection ---------------- */
 
-int tc_check_interface(const char *iface, char *err, size_t errlen) {
+/* Read the interface's root qdisc once.
+ * Returns 0 if TestLag may manage the interface, with *needs_teardown set when
+ * a real root qdisc is in place and has to be deleted before ours can be
+ * added; -1 with err filled if a foreign root qdisc is in the way.
+ * `noqueue` is the kernel's placeholder for "no root qdisc", not something to
+ * delete: htb can be added straight over it. */
+static int check_interface_state(const char *iface, gboolean *needs_teardown,
+                                 char *err, size_t errlen) {
+    if (needs_teardown) *needs_teardown = FALSE;
     if (!tc_valid_iface(iface)) {
         g_snprintf(err, errlen, "Invalid interface name: %s", iface ? iface : "(none)");
         return -1;
@@ -294,30 +451,90 @@ int tc_check_interface(const char *iface, char *err, size_t errlen) {
         return -1;
     }
     char **lines = g_strsplit(out, "\n", -1);
+    int rc = 0;                 /* no root line at all => clean */
     for (int i = 0; lines[i]; i++) {
         char *l = lines[i];
         if (!strstr(l, "root"))
             continue; /* only the root qdisc line contains "root" */
-        if (strstr(l, "noqueue") || strstr(l, "fq_codel")) {
-            /* kernel default root: safe to replace */
-            g_strfreev(lines);
-            return 0;
-        }
-        if (strstr(l, "htb")) {
-            /* our own root from a previous run: safe to rebuild */
-            g_strfreev(lines);
-            return 0;
+        if (strstr(l, "noqueue"))
+            break;              /* kernel placeholder: add straight over it */
+        if (strstr(l, "fq_codel") || strstr(l, "htb")) {
+            /* kernel default, or our own root from a previous run: ours to
+               replace, but the existing qdisc has to go first */
+            if (needs_teardown) *needs_teardown = TRUE;
+            break;
         }
         g_snprintf(err, errlen,
             "Interface %s already has a root qdisc:\n  %s\n"
             "TestLag manages its own root qdisc and will not touch an existing one.\n"
             "Remove it first if you want TestLag to take over:\n  tc qdisc del dev %s root",
             iface, g_strstrip(l), iface);
-        g_strfreev(lines);
-        return -1;
+        rc = -1;
+        break;
     }
     g_strfreev(lines);
-    return 0; /* no root line at all => clean */
+    return rc;
+}
+
+int tc_check_interface(const char *iface, char *err, size_t errlen) {
+    return check_interface_state(iface, NULL, err, errlen);
+}
+
+/* TRUE if iface currently carries a root qdisc we built (htb). Any other root
+ * -- the kernel default, or a foreign qdisc -- means our rules are not applied
+ * to it, whatever the profile says. */
+static gboolean tc_iface_is_shaped(const char *iface) {
+    if (!tc_valid_iface(iface))
+        return FALSE;
+    char cmd[512], out[8192];
+    g_snprintf(cmd, sizeof cmd, "tc qdisc show dev %s", iface);
+    if (tc_run(cmd, FALSE, out, sizeof out) != 0)
+        return FALSE;   /* interface gone, or tc unreadable: not shaped by us */
+    gboolean ours = FALSE;
+    char **lines = g_strsplit(out, "\n", -1);
+    for (int i = 0; lines[i] && !ours; i++)
+        if (strstr(lines[i], "root") && strstr(lines[i], "htb"))
+            ours = TRUE;
+    g_strfreev(lines);
+    return ours;
+}
+
+GPtrArray *tc_profile_ifaces(const LagProfile *p, gboolean active_only) {
+    GPtrArray *arr = g_ptr_array_new_with_free_func(g_free);
+    if (!p)
+        return arr;
+    for (int i = 0; i < p->count; i++) {
+        const LagRule *r = &p->rules[i];
+        if (!r->iface[0] || (active_only && !r->active))
+            continue;
+        gboolean dup = FALSE;
+        for (guint k = 0; k < arr->len && !dup; k++)
+            if (g_strcmp0((const char *)g_ptr_array_index(arr, k), r->iface) == 0)
+                dup = TRUE;
+        if (!dup)
+            g_ptr_array_add(arr, g_strdup(r->iface));
+    }
+    return arr;
+}
+
+int tc_sync_active_state(LagProfile *p) {
+    if (!p)
+        return 0;
+    GPtrArray *ifs = tc_profile_ifaces(p, TRUE);
+    int cleared = 0;
+    for (guint k = 0; k < ifs->len; k++) {
+        const char *iface = g_ptr_array_index(ifs, k);
+        if (tc_iface_is_shaped(iface))
+            continue;
+        for (int i = 0; i < p->count; i++) {
+            if (!p->rules[i].active || g_strcmp0(p->rules[i].iface, iface) != 0)
+                continue;
+            p->rules[i].active = FALSE;
+            cleared++;
+        }
+    }
+    g_ptr_array_free(ifs, TRUE);
+    return cleared;
 }
 
 char *tc_get_state_text(const char *iface) {
@@ -382,23 +599,37 @@ char *tc_build_netem(const LagRule *r) {
     return g_string_free(s, FALSE);
 }
 
+static gboolean rule_is_v6(const LagRule *r) {
+    return ip_is_v6(r->src_ip) || ip_is_v6(r->dst_ip);
+}
+
 char *tc_build_filter(const LagRule *r, const char *iface, int classid) {
     if (lag_rule_is_all(r))
         return NULL;
-    gboolean is_v6 = (r->ip[0] != '\0' && strchr(r->ip, ':') != NULL);
-    GString *s = g_string_new("tc filter add dev ");
+    gboolean is_v6 = rule_is_v6(r);
+    GString *s = g_string_new("filter add dev ");
     g_string_append(s, iface);
     g_string_append(s, " parent 1: protocol ");
     g_string_append(s, is_v6 ? "ipv6" : "ip");
-    g_string_append(s, " u32 ");
+    g_string_append(s, " u32");
+    /* Source is this machine and destination is the peer: netem shapes the
+     * packets leaving the interface, so a reply from a local service matches
+     * on source and a request this machine makes matches on destination. */
     if (is_v6) {
-        /* u32 port matching for IPv6 is not supported; dst only */
-        g_string_append_printf(s, "match ip6 dst %s", r->ip);
+        /* u32 port matching for IPv6 is not supported; addresses only */
+        if (r->src_ip[0])
+            g_string_append_printf(s, " match ip6 src %s", r->src_ip);
+        if (r->dst_ip[0])
+            g_string_append_printf(s, " match ip6 dst %s", r->dst_ip);
     } else {
-        if (r->ip[0])
-            g_string_append_printf(s, "match ip dst %s/32", r->ip);
-        if (r->port[0])
-            g_string_append_printf(s, " match ip dport %s 0xffff", r->port);
+        if (r->src_ip[0])
+            g_string_append_printf(s, " match ip src %s/32", r->src_ip);
+        if (r->dst_ip[0])
+            g_string_append_printf(s, " match ip dst %s/32", r->dst_ip);
+        if (r->src_port[0])
+            g_string_append_printf(s, " match ip sport %s 0xffff", r->src_port);
+        if (r->dst_port[0])
+            g_string_append_printf(s, " match ip dport %s 0xffff", r->dst_port);
     }
     g_string_append_printf(s, " flowid 1:%d", classid);
     return g_string_free(s, FALSE);
@@ -422,7 +653,8 @@ int tc_apply_interface(LagProfile *p, const char *iface, char *err, size_t errle
             return -1;
         }
     }
-    if (tc_check_interface(iface, err, errlen) != 0)
+    gboolean needs_teardown = FALSE;
+    if (check_interface_state(iface, &needs_teardown, err, errlen) != 0)
         return -1;
 
     int active_count = 0;
@@ -430,33 +662,25 @@ int tc_apply_interface(LagProfile *p, const char *iface, char *err, size_t errle
         if (p->rules[i].active && g_strcmp0(p->rules[i].iface, iface) == 0)
             active_count++;
 
-    char cmd[2048], out[8192];
+    char cmd[512], out[8192];
 
     if (active_count == 0) {
-        /* nothing to shape: restore clean state (ignore "no qdisc" errors) */
-        g_snprintf(cmd, sizeof cmd, "tc qdisc del dev %s root", iface);
-        tc_run(cmd, TRUE, out, sizeof out);
+        /* nothing to shape: restore clean state */
+        if (needs_teardown) {
+            g_snprintf(cmd, sizeof cmd, "tc qdisc del dev %s root", iface);
+            tc_run(cmd, TRUE, out, sizeof out);
+        }
         return 0;
     }
 
-    /* teardown whatever we had, then rebuild from scratch */
-    g_snprintf(cmd, sizeof cmd, "tc qdisc del dev %s root", iface);
-    tc_run(cmd, TRUE, out, sizeof out);
-
-    g_snprintf(cmd, sizeof cmd,
-               "tc qdisc add dev %s root handle 1: htb default 1", iface);
-    if (tc_run(cmd, TRUE, out, sizeof out) != 0) {
-        g_snprintf(err, errlen, "Failed to add htb root on %s:\n%s", iface, out);
-        return -1;
-    }
-
-    g_snprintf(cmd, sizeof cmd,
-               "tc class add dev %s parent 1: classid 1:1 htb rate %s ceil %s",
-               iface, LAG_CLASS_RATE, LAG_CLASS_RATE);
-    if (tc_run(cmd, TRUE, out, sizeof out) != 0) {
-        g_snprintf(err, errlen, "Failed to add class 1:1 on %s:\n%s", iface, out);
-        return -1;
-    }
+    /* Build the whole tree as one batch before touching the interface: a rule
+     * set we cannot express leaves the running configuration alone. */
+    GPtrArray *batch = g_ptr_array_new_with_free_func(g_free);
+    g_ptr_array_add(batch, g_strdup_printf(
+        "qdisc add dev %s root handle 1: htb default 1", iface));
+    g_ptr_array_add(batch, g_strdup_printf(
+        "class add dev %s parent 1: classid 1:1 htb rate %s ceil %s",
+        iface, LAG_CLASS_RATE, LAG_CLASS_RATE));
 
     gboolean all_used = FALSE;
     int next_class = 2;
@@ -471,55 +695,47 @@ int tc_apply_interface(LagProfile *p, const char *iface, char *err, size_t errle
                 g_snprintf(err, errlen,
                     "Interface %s has more than one all-traffic rule active; "
                     "only one is allowed.", iface);
+                g_ptr_array_free(batch, TRUE);
                 return -1;
             }
             all_used = TRUE;
-            cls = 1;
+            cls = 1;            /* the htb default class, already created */
         } else {
             cls = next_class++;
+            g_ptr_array_add(batch, g_strdup_printf(
+                "class add dev %s parent 1: classid 1:%d htb rate %s ceil %s",
+                iface, cls, LAG_CLASS_RATE, LAG_CLASS_RATE));
         }
 
-        if (!lag_rule_is_all(r)) {
-            g_snprintf(cmd, sizeof cmd,
-                       "tc class add dev %s parent 1: classid 1:%d htb rate %s ceil %s",
-                       iface, cls, LAG_CLASS_RATE, LAG_CLASS_RATE);
-            if (tc_run(cmd, TRUE, out, sizeof out) != 0) {
-                g_snprintf(err, errlen,
-                    "Failed to add class 1:%d on %s:\n%s", cls, iface, out);
-                return -1;
-            }
-        }
         char *netem = tc_build_netem(r);
-        g_snprintf(cmd, sizeof cmd,
-                   "tc qdisc add dev %s parent 1:%d %s", iface, cls, netem);
+        g_ptr_array_add(batch, g_strdup_printf(
+            "qdisc add dev %s parent 1:%d %s", iface, cls, netem));
         g_free(netem);
-        if (tc_run(cmd, TRUE, out, sizeof out) != 0) {
-            g_snprintf(err, errlen,
-                "Failed to add netem to %s (class 1:%d):\n%s", iface, cls, out);
-            return -1;
-        }
 
         char *filt = tc_build_filter(r, iface, cls);
-        if (filt) {
-            int rc = tc_run(filt, TRUE, out, sizeof out);
-            g_free(filt);
-            if (rc != 0) {
-                g_snprintf(err, errlen, "Failed to add filter on %s:\n%s", iface, out);
-                return -1;
-            }
-        }
+        if (filt)
+            g_ptr_array_add(batch, filt);   /* the array owns it now */
     }
     if (!all_used) {
         /* no all-traffic rule active: give the htb default class (1:1) a
            pass-through queue, otherwise unmatched traffic has no leaf qdisc
            and is dropped by the tree. */
-        g_snprintf(cmd, sizeof cmd,
-                   "tc qdisc add dev %s parent 1:1 pfifo limit 1000", iface);
-        if (tc_run(cmd, TRUE, out, sizeof out) != 0) {
-            g_snprintf(err, errlen,
-                "Failed to add pass-through qdisc on %s:\n%s", iface, out);
-            return -1;
-        }
+        g_ptr_array_add(batch, g_strdup_printf(
+            "qdisc add dev %s parent 1:1 pfifo limit 1000", iface));
+    }
+
+    /* Tear down whatever we had; htb will not go on top of an existing root. */
+    if (needs_teardown) {
+        g_snprintf(cmd, sizeof cmd, "tc qdisc del dev %s root", iface);
+        tc_run(cmd, TRUE, out, sizeof out);
+    }
+
+    int rc = tc_run_batch((const char *const *)batch->pdata, (int)batch->len,
+                          out, sizeof out);
+    g_ptr_array_free(batch, TRUE);
+    if (rc != 0) {
+        g_snprintf(err, errlen, "Failed to apply rules on %s:\n%s", iface, out);
+        return -1;
     }
     return 0;
 }

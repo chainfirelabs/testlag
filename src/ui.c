@@ -12,8 +12,8 @@
 #include "tc.h"
 
 enum {
-    COL_IFACE, COL_IP, COL_PORT, COL_BW, COL_LAT, COL_JIT, COL_DROP,
-    COL_STATUS, N_COLS
+    COL_IFACE, COL_SRC_IP, COL_SRC_PORT, COL_DST_IP, COL_DST_PORT,
+    COL_BW, COL_LAT, COL_JIT, COL_DROP, COL_STATUS, N_COLS
 };
 
 typedef struct {
@@ -27,8 +27,10 @@ typedef struct {
 
     /* form */
     GtkWidget *iface_combo;
-    GtkWidget *ip_entry;
-    GtkWidget *port_entry;
+    GtkWidget *src_ip_entry;
+    GtkWidget *src_port_entry;
+    GtkWidget *dst_ip_entry;
+    GtkWidget *dst_port_entry;
     GtkWidget *bw_entry;
     GtkWidget *latency_spin;
     GtkWidget *jitter_spin;
@@ -107,8 +109,10 @@ static void ui_refresh_list(UI *ui) {
         g_snprintf(drop, sizeof drop, "%g%%", r->drop_pct);
         gtk_list_store_set(ui->store, &it,
             COL_IFACE,  r->iface,
-            COL_IP,     r->ip[0] ? r->ip : "(all)",
-            COL_PORT,   r->port[0] ? r->port : "(all)",
+            COL_SRC_IP,   r->src_ip[0]   ? r->src_ip   : "(all)",
+            COL_SRC_PORT, r->src_port[0] ? r->src_port : "(all)",
+            COL_DST_IP,   r->dst_ip[0]   ? r->dst_ip   : "(all)",
+            COL_DST_PORT, r->dst_port[0] ? r->dst_port : "(all)",
             COL_BW,     r->bandwidth[0] ? r->bandwidth : "(none)",
             COL_LAT,    lat,
             COL_JIT,    jit,
@@ -134,37 +138,49 @@ static int ui_selected_index(UI *ui) {
 }
 
 static void clear_form(UI *ui) {
-    gtk_entry_set_text(GTK_ENTRY(ui->ip_entry), "");
-    gtk_entry_set_text(GTK_ENTRY(ui->port_entry), "");
+    gtk_entry_set_text(GTK_ENTRY(ui->src_ip_entry), "");
+    gtk_entry_set_text(GTK_ENTRY(ui->src_port_entry), "");
+    gtk_entry_set_text(GTK_ENTRY(ui->dst_ip_entry), "");
+    gtk_entry_set_text(GTK_ENTRY(ui->dst_port_entry), "");
     gtk_entry_set_text(GTK_ENTRY(ui->bw_entry), "");
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->latency_spin), 0);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->jitter_spin), 0);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->drop_spin), 0);
 }
 
-static void load_form(UI *ui, const LagRule *r) {
-    /* select iface in combo if present */
-    if (r->iface[0]) {
-        GtkTreeModel *model = gtk_combo_box_get_model(GTK_COMBO_BOX(ui->iface_combo));
-        int n = gtk_tree_model_iter_n_children(model, NULL);
-        for (int i = 0; i < n; i++) {
-            GtkTreeIter it;
-            if (!gtk_tree_model_iter_nth_child(model, &it, NULL, i))
-                continue;
-            char *t = NULL;
-            gtk_tree_model_get(model, &it, 0, &t, -1);
-            gboolean match = (g_strcmp0(t, r->iface) == 0);
-            g_free(t);
-            if (match) {
-                gtk_combo_box_set_active(GTK_COMBO_BOX(ui->iface_combo), i);
-                return;
-            }
+/* Select r->iface in the combo, appending it if the interface is not in the
+ * list (a profile can name an interface that is not present right now). */
+static void load_form_iface(UI *ui, const LagRule *r) {
+    if (!r->iface[0])
+        return;
+    GtkTreeModel *model = gtk_combo_box_get_model(GTK_COMBO_BOX(ui->iface_combo));
+    int n = gtk_tree_model_iter_n_children(model, NULL);
+    for (int i = 0; i < n; i++) {
+        GtkTreeIter it;
+        if (!gtk_tree_model_iter_nth_child(model, &it, NULL, i))
+            continue;
+        char *t = NULL;
+        gtk_tree_model_get(model, &it, 0, &t, -1);
+        gboolean match = (g_strcmp0(t, r->iface) == 0);
+        g_free(t);
+        if (match) {
+            gtk_combo_box_set_active(GTK_COMBO_BOX(ui->iface_combo), i);
+            return;
         }
-        gtk_combo_box_text_insert_text(GTK_COMBO_BOX_TEXT(ui->iface_combo), -1, r->iface);
-        gtk_combo_box_set_active(GTK_COMBO_BOX(ui->iface_combo), n);
     }
-    gtk_entry_set_text(GTK_ENTRY(ui->ip_entry), r->ip);
-    gtk_entry_set_text(GTK_ENTRY(ui->port_entry), r->port);
+    gtk_combo_box_text_insert_text(GTK_COMBO_BOX_TEXT(ui->iface_combo), -1, r->iface);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(ui->iface_combo), n);
+}
+
+/* Fill the form from a rule. Every field is loaded: the form is what "Edit
+ * selected" reads back, so a field left behind here would be written to the
+ * rule as an empty/zero value. */
+static void load_form(UI *ui, const LagRule *r) {
+    load_form_iface(ui, r);
+    gtk_entry_set_text(GTK_ENTRY(ui->src_ip_entry), r->src_ip);
+    gtk_entry_set_text(GTK_ENTRY(ui->src_port_entry), r->src_port);
+    gtk_entry_set_text(GTK_ENTRY(ui->dst_ip_entry), r->dst_ip);
+    gtk_entry_set_text(GTK_ENTRY(ui->dst_port_entry), r->dst_port);
     gtk_entry_set_text(GTK_ENTRY(ui->bw_entry), r->bandwidth);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->latency_spin), r->latency_ms);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(ui->jitter_spin), r->jitter_ms);
@@ -189,22 +205,27 @@ static gboolean form_get_rule(UI *ui, LagRule *r, char *err, size_t errlen) {
     g_strlcpy(r->iface, iface, LAG_IFACE_LEN);
     g_free(iface);
 
-    const char *ip = gtk_entry_get_text(GTK_ENTRY(ui->ip_entry));
-    if (ip && *ip) {
-        if (!tc_valid_ip(ip)) {
-            g_snprintf(err, errlen, "Invalid IP address: %s", ip);
+    static const struct { const char *what; size_t off, len; gboolean is_port; }
+    match_fields[] = {
+        { "Source IP",        offsetof(LagRule, src_ip),   LAG_IP_LEN,   FALSE },
+        { "Source port",      offsetof(LagRule, src_port), LAG_PORT_LEN, TRUE  },
+        { "Destination IP",   offsetof(LagRule, dst_ip),   LAG_IP_LEN,   FALSE },
+        { "Destination port", offsetof(LagRule, dst_port), LAG_PORT_LEN, TRUE  },
+    };
+    GtkWidget *match_entries[] = {
+        ui->src_ip_entry, ui->src_port_entry,
+        ui->dst_ip_entry, ui->dst_port_entry,
+    };
+    for (guint m = 0; m < G_N_ELEMENTS(match_fields); m++) {
+        const char *v = gtk_entry_get_text(GTK_ENTRY(match_entries[m]));
+        if (!v || !*v)
+            continue;
+        if (match_fields[m].is_port ? !tc_valid_port(v) : !tc_valid_ip(v)) {
+            g_snprintf(err, errlen, "Invalid %s: %s%s", match_fields[m].what, v,
+                       match_fields[m].is_port ? " (must be 1-65535)" : "");
             return FALSE;
         }
-        g_strlcpy(r->ip, ip, LAG_IP_LEN);
-    }
-
-    const char *port = gtk_entry_get_text(GTK_ENTRY(ui->port_entry));
-    if (port && *port) {
-        if (!tc_valid_port(port)) {
-            g_snprintf(err, errlen, "Invalid port: %s (must be 1-65535)", port);
-            return FALSE;
-        }
-        g_strlcpy(r->port, port, LAG_PORT_LEN);
+        g_strlcpy((char *)r + match_fields[m].off, v, match_fields[m].len);
     }
 
     const char *bw = gtk_entry_get_text(GTK_ENTRY(ui->bw_entry));
@@ -281,8 +302,11 @@ static void do_start(UI *ui, int idx) {
         show_error(ui, "Start failed", err);
         return;
     }
-    ui_log(ui, "Started rule on %s (ip=%s port=%s lat=%.3gms jit=%.3gms drop=%.3g%% bw=%s)",
-        r->iface, r->ip[0] ? r->ip : "any", r->port[0] ? r->port : "any",
+    ui_log(ui, "Started rule on %s (src %s:%s -> dst %s:%s, "
+        "lat=%.3gms jit=%.3gms drop=%.3g%% bw=%s)",
+        r->iface,
+        r->src_ip[0] ? r->src_ip : "any", r->src_port[0] ? r->src_port : "any",
+        r->dst_ip[0] ? r->dst_ip : "any", r->dst_port[0] ? r->dst_port : "any",
         r->latency_ms, r->jitter_ms, r->drop_pct,
         r->bandwidth[0] ? r->bandwidth : "unlimited");
     ui_refresh_list(ui);
@@ -399,20 +423,90 @@ static void on_stop_clicked(GtkButton *b, gpointer data) {
     do_stop((UI *)data, ui_selected_index((UI *)data));
 }
 
+/* Put the active flags of one interface's rules back the way they were. */
+static void restore_iface_flags(UI *ui, const char *iface,
+                                const gboolean *saved) {
+    for (int i = 0; i < ui->profile->count; i++)
+        if (g_strcmp0(ui->profile->rules[i].iface, iface) == 0)
+            ui->profile->rules[i].active = saved[i];
+}
+
+/* Start/stop every rule at once.
+ *
+ * tc_apply_interface() rebuilds an interface's whole qdisc tree from all of
+ * its active rules, so the flags are flipped first and each interface is
+ * converged exactly once. Doing it a rule at a time rebuilt the tree once per
+ * rule -- quadratic in the rule count -- and unprivileged every tc command in
+ * every rebuild is a separate sudo invocation, i.e. a separate PAM/logind
+ * session. Forty rules cost ~2700 processes that way, enough to run the
+ * machine out of file descriptors.
+ * Returns the number of interfaces that could not be converged. */
+static int start_stop_all(UI *ui, gboolean start) {
+    gboolean saved[LAG_MAX_RULES];
+    int changed = 0;
+    for (int i = 0; i < ui->profile->count; i++) {
+        saved[i] = ui->profile->rules[i].active;
+        if (ui->profile->rules[i].active != start) {
+            ui->profile->rules[i].active = start;
+            changed++;
+        }
+    }
+    if (!changed)
+        return 0;
+
+    /* For a stop the rules are already inactive, so the interfaces to converge
+       are the ones that were active a moment ago: take the list from the flags
+       we saved, not from the current ones. */
+    GPtrArray *ifs;
+    if (start) {
+        ifs = tc_profile_ifaces(ui->profile, TRUE);
+    } else {
+        for (int i = 0; i < ui->profile->count; i++)
+            ui->profile->rules[i].active = saved[i];
+        ifs = tc_profile_ifaces(ui->profile, TRUE);
+        for (int i = 0; i < ui->profile->count; i++)
+            ui->profile->rules[i].active = FALSE;
+    }
+
+    int failed = 0;
+    for (guint k = 0; k < ifs->len; k++) {
+        const char *iface = g_ptr_array_index(ifs, k);
+        char err[2048];
+        if (tc_apply_interface(ui->profile, iface, err, sizeof err) == 0) {
+            ui_log(ui, "%s all rules on %s", start ? "Started" : "Stopped", iface);
+            continue;
+        }
+        failed++;
+        if (!start) {
+            /* the rules are still applied, so say so rather than showing them
+               as stopped */
+            restore_iface_flags(ui, iface, saved);
+            ui_log(ui, "WARNING: stop on %s: %s", iface, err);
+            continue;
+        }
+        /* Roll this interface back to the state it was in and re-converge, so
+           a failure here leaves the rules that were already running alone. */
+        restore_iface_flags(ui, iface, saved);
+        char rerr[2048];
+        if (tc_apply_interface(ui->profile, iface, rerr, sizeof rerr) != 0)
+            ui_log(ui, "WARNING: could not restore %s: %s", iface, rerr);
+        show_error(ui, "Start failed", err);
+    }
+    g_ptr_array_free(ifs, TRUE);
+
+    ui_refresh_list(ui);
+    refresh_state_now(ui);
+    return failed;
+}
+
 static void on_start_all_clicked(GtkButton *b, gpointer data) {
     (void)b;
-    UI *ui = data;
-    for (int i = 0; i < ui->profile->count; i++)
-        if (!ui->profile->rules[i].active)
-            do_start(ui, i);
+    start_stop_all((UI *)data, TRUE);
 }
 
 static void on_stop_all_clicked(GtkButton *b, gpointer data) {
     (void)b;
-    UI *ui = data;
-    for (int i = ui->profile->count - 1; i >= 0; i--)
-        if (ui->profile->rules[i].active)
-            do_stop(ui, i);
+    start_stop_all((UI *)data, FALSE);
 }
 
 static void on_save_clicked(GtkButton *b, gpointer data) {
@@ -479,6 +573,71 @@ static void on_row_selected(GtkTreeSelection *sel, gpointer data) {
         load_form(ui, &ui->profile->rules[idx]);
 }
 
+/* Ask before quitting. Returns TRUE if the user wants to go ahead. */
+static gboolean confirm_quit(UI *ui, const char *detail) {
+    GtkWidget *dlg = gtk_message_dialog_new(GTK_WINDOW(ui->window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE, "%s", "Exit TestLag?");
+    gtk_dialog_add_buttons(GTK_DIALOG(dlg),
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Exit", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_CANCEL);
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dlg), "%s", detail);
+    gint resp = gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+    return resp == GTK_RESPONSE_ACCEPT;
+}
+
+/* Closing the window (the X, or the window manager) asks first, and a
+ * confirmed exit takes the shaping down with it: qdiscs live in the kernel,
+ * not in this process, so rules left running would keep shaping traffic long
+ * after TestLag is gone -- with nothing on screen to say so. */
+static gboolean on_delete_event(GtkWidget *w, GdkEvent *e, gpointer data) {
+    (void)w; (void)e;
+    UI *ui = data;
+
+    int active = 0;
+    for (int i = 0; i < ui->profile->count; i++)
+        if (ui->profile->rules[i].active)
+            active++;
+
+    GString *detail = g_string_new("");
+    if (active > 0) {
+        GPtrArray *ifs = tc_profile_ifaces(ui->profile, TRUE);
+        g_string_append_printf(detail, "%d rule%s currently active on ",
+                               active, active == 1 ? " is" : "s are");
+        for (guint k = 0; k < ifs->len; k++)
+            g_string_append_printf(detail, "%s%s", k ? ", " : "",
+                                   (const char *)g_ptr_array_index(ifs, k));
+        g_string_append(detail,
+            ".\n\nExiting removes them from tc, so those interfaces go back to "
+            "normal. The rules stay in the profile and can be started again "
+            "next time.");
+        g_ptr_array_free(ifs, TRUE);
+    } else {
+        g_string_append(detail,
+            "No rules are active. The profile is saved on exit.");
+    }
+    gboolean go = confirm_quit(ui, detail->str);
+    g_string_free(detail, TRUE);
+    if (!go)
+        return TRUE;            /* keep the window open */
+
+    if (active > 0 && start_stop_all(ui, FALSE) > 0) {
+        /* The log is about to disappear with the window, so say it here. */
+        GString *msg = g_string_new(
+            "Some interfaces could not be cleared, so their shaping is still "
+            "in place after exit. Remove it by hand with:\n");
+        GPtrArray *ifs = tc_profile_ifaces(ui->profile, TRUE);
+        for (guint k = 0; k < ifs->len; k++)
+            g_string_append_printf(msg, "\n  sudo tc qdisc del dev %s root",
+                                   (const char *)g_ptr_array_index(ifs, k));
+        g_ptr_array_free(ifs, TRUE);
+        show_error(ui, "Could not stop every rule", msg->str);
+        g_string_free(msg, TRUE);
+    }
+    return FALSE;               /* let the window be destroyed */
+}
+
 static void on_destroy(GtkWidget *w, gpointer data) {
     (void)w;
     UI *ui = data;
@@ -513,14 +672,15 @@ static GtkWidget *make_spin(double lo, double hi, double step) {
 static void build_tree(UI *ui, GtkWidget *vbox) {
     ui->store = gtk_list_store_new(N_COLS,
         G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
-        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_STRING, G_TYPE_STRING);
 
     ui->tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(ui->store));
     gtk_tree_view_set_reorderable(GTK_TREE_VIEW(ui->tree), FALSE);
 
     const char *titles[N_COLS] = {
-        "Interface", "IP", "Port", "Bandwidth",
-        "Latency", "Jitter", "Drop", "Status"
+        "Interface", "Src IP", "Src port", "Dst IP", "Dst port",
+        "Bandwidth", "Latency", "Jitter", "Drop", "Status"
     };
     for (int c = 0; c < N_COLS; c++) {
         GtkCellRenderer *rend = gtk_cell_renderer_text_new();
@@ -553,34 +713,68 @@ static void build_form(UI *ui, GtkWidget *vbox) {
     gtk_box_pack_start(GTK_BOX(vbox), frame, FALSE, FALSE, 0);
 
     ui->iface_combo = gtk_combo_box_text_new_with_entry();
-    ui->ip_entry    = gtk_entry_new();
-    ui->port_entry  = gtk_entry_new();
+    ui->src_ip_entry   = gtk_entry_new();
+    ui->src_port_entry = gtk_entry_new();
+    ui->dst_ip_entry   = gtk_entry_new();
+    ui->dst_port_entry = gtk_entry_new();
     ui->bw_entry    = gtk_entry_new();
     ui->latency_spin = make_spin(0, 60000, 10);
     ui->jitter_spin  = make_spin(0, 60000, 1);
     ui->drop_spin    = make_spin(0, 100, 1);
 
-    gtk_entry_set_placeholder_text(GTK_ENTRY(ui->ip_entry), "IP (blank = all)");
-    gtk_entry_set_placeholder_text(GTK_ENTRY(ui->port_entry), "port (blank = all)");
-    gtk_entry_set_placeholder_text(GTK_ENTRY(ui->bw_entry), "bandwidth e.g. 100kbit (blank = unlimited)");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(ui->src_ip_entry), "blank = any");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(ui->src_port_entry), "e.g. 80");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(ui->dst_ip_entry), "blank = any");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(ui->dst_port_entry), "blank = any");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(ui->bw_entry), "e.g. 100kbit (blank = unlimited)");
+
+    /* The one thing that is not guessable from the form: these rules act on
+       traffic on its way OUT, so "source" is always this machine. */
+    gtk_widget_set_tooltip_text(ui->src_ip_entry,
+        "Source address of the outgoing packet: an address of this machine.");
+    gtk_widget_set_tooltip_text(ui->src_port_entry,
+        "Source port of the outgoing packet -- the port a local service "
+        "answers from. Use 80 to lag what your own web server sends back.");
+    gtk_widget_set_tooltip_text(ui->dst_ip_entry,
+        "Destination address: the peer you are sending to.");
+    gtk_widget_set_tooltip_text(ui->dst_port_entry,
+        "Destination port: the port on the peer you are sending to.");
 
     int col = 0;
     gtk_grid_attach(GTK_GRID(grid), make_label("Interface"), col++, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), ui->iface_combo, col++, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_label("Destination IP"), col++, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), ui->ip_entry, col++, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_label("Port"), col++, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), ui->port_entry, col++, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), make_label("Source IP"), col++, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), ui->src_ip_entry, col++, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), make_label("Source port"), col++, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), ui->src_port_entry, col++, 0, 1, 1);
 
     col = 0;
     gtk_grid_attach(GTK_GRID(grid), make_label("Bandwidth"), col++, 1, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), ui->bw_entry, col++, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_label("Latency (ms)"), col++, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), ui->latency_spin, col++, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_label("Jitter (ms)"), col++, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), ui->jitter_spin, col++, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), make_label("Drop (%)"), col++, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), ui->drop_spin, col++, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), make_label("Destination IP"), col++, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), ui->dst_ip_entry, col++, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), make_label("Destination port"), col++, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), ui->dst_port_entry, col++, 1, 1, 1);
+
+    col = 0;
+    gtk_grid_attach(GTK_GRID(grid), make_label("Latency (ms)"), col++, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), ui->latency_spin, col++, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), make_label("Jitter (ms)"), col++, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), ui->jitter_spin, col++, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), make_label("Drop (%)"), col++, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), ui->drop_spin, col++, 2, 1, 1);
+
+    GtkWidget *hint = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(hint),
+        "<small>Rules shape traffic <b>leaving</b> this interface: source is "
+        "this machine, destination is the peer. To lag devices talking to a "
+        "local service, match its <b>source port</b> (its replies); to lag "
+        "what you send out, match the <b>destination</b>. Leave a field blank "
+        "to match anything; leave all four blank for all traffic."
+        "</small>");
+    gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
+    gtk_widget_set_halign(hint, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(grid), hint, 0, 3, 6, 1);
 
     /* action buttons — each wired to its callback */
     GtkWidget *btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
@@ -599,7 +793,7 @@ static void build_form(UI *ui, GtkWidget *vbox) {
     gtk_box_pack_start(GTK_BOX(btns), b_stop, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(btns), b_start_all, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(btns), b_stop_all, FALSE, FALSE, 0);
-    gtk_grid_attach(GTK_GRID(grid), btns, 0, 2, N_COLS, 1);
+    gtk_grid_attach(GTK_GRID(grid), btns, 0, 4, 6, 1);
 
     g_signal_connect(b_add,       "clicked", G_CALLBACK(on_add_clicked),       ui);
     g_signal_connect(b_edit,      "clicked", G_CALLBACK(on_edit_clicked),      ui);
@@ -756,6 +950,7 @@ void ui_run(LagProfile *profile, const char *profile_path, gboolean use_sudo) {
     gtk_window_set_default_size(GTK_WINDOW(ui->window), 980, 720);
     char *logo = find_logo_path();
     gtk_window_set_icon_from_file(GTK_WINDOW(ui->window), logo, NULL);
+    g_signal_connect(ui->window, "delete-event", G_CALLBACK(on_delete_event), ui);
     g_signal_connect(ui->window, "destroy", G_CALLBACK(on_destroy), ui);
 
     /* CSD titlebar: logo icon upper-left, title, close button */

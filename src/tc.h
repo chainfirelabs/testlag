@@ -17,6 +17,15 @@ gboolean tc_get_use_sudo(void);
  * launched. */
 int tc_run(const char *cmd, gboolean needs_priv, char *out, size_t outlen);
 
+/* Run several tc commands in a single privileged process, via tc's own batch
+ * mode. `lines` are tc argument lines WITHOUT the leading "tc", e.g.
+ * "qdisc add dev lo root handle 1: htb default 1". Still no shell: the batch
+ * is data on the child's stdin, never a command line. tc stops at the first
+ * command that fails, naming the line in its output.
+ * Combined stdout+stderr is captured into out (if non-NULL). Returns the exit
+ * status (0 = every command succeeded) or -1 if the child could not run. */
+int tc_run_batch(const char *const *lines, int n, char *out, size_t outlen);
+
 /* Network interface names. Caller frees with g_ptr_array_free(arr, TRUE). */
 GPtrArray *tc_list_interfaces(void);
 
@@ -31,10 +40,27 @@ int tc_apply_interface(LagProfile *p, const char *iface, char *err, size_t errle
 /* Remove all lag qdiscs/filters from iface (best effort). */
 int tc_clear_interface(const char *iface, char *err, size_t errlen);
 
+/* Distinct interface names named by the profile's rules, in first-seen order
+ * (active_only: consider only rules that are active). Interfaces are the unit
+ * of work for tc_apply_interface(), so callers that touch several rules must
+ * converge each interface once rather than once per rule.
+ * Caller frees with g_ptr_array_free(arr, TRUE). */
+GPtrArray *tc_profile_ifaces(const LagProfile *p, gboolean active_only);
+
+/* Reconcile the profile's `active` flags with the live tc state.
+ * A profile records which rules were running when it was saved, but the qdisc
+ * tree lives in the kernel, not in the file: after a reboot -- or any time the
+ * qdiscs were removed behind our back -- a rule marked active is not applied
+ * any more. Rules on an interface we are not currently shaping are marked
+ * inactive. Read-only: it inspects tc state and never changes it.
+ * Returns the number of rules whose flag was cleared. */
+int tc_sync_active_state(LagProfile *p);
+
 /* Build the netem parameter string for a rule (newly allocated; may be "netem"). */
 char *tc_build_netem(const LagRule *r);
 
-/* Build the filter command for a rule (newly allocated) or NULL if all-traffic. */
+/* Build the filter line for a rule -- tc arguments without the leading "tc",
+ * for tc_run_batch() -- or NULL if the rule is all-traffic. Newly allocated. */
 char *tc_build_filter(const LagRule *r, const char *iface, int classid);
 
 /* Human-readable active qdisc/filter state for iface (newly allocated). */
