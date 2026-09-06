@@ -153,25 +153,42 @@ int tc_run(const char *cmd, gboolean needs_priv, char *out, size_t outlen) {
     return status;
 }
 
-/* Read a pipe to EOF. Newly allocated, never NULL. */
+/* Most output we ever keep from a child. Only the first part is ever shown in
+ * an error message, and the pipe still has to be drained to EOF whatever the
+ * child writes, so read everything but stop accumulating past this. */
+#define TC_OUTPUT_MAX 65536
+
+/* Read a pipe to EOF, keeping at most TC_OUTPUT_MAX bytes. Draining to the end
+ * matters: a child left blocked writing to a full pipe would never exit, and
+ * the waitpid() below would block with it.
+ * Newly allocated, never NULL. */
 static char *read_all(int fd) {
     GString *s = g_string_new("");
     char buf[4096];
     for (;;) {
         ssize_t n = read(fd, buf, sizeof buf);
-        if (n > 0)       g_string_append_len(s, buf, n);
-        else if (n == 0) break;
-        else if (errno != EINTR) break;
+        if (n > 0) {
+            if (s->len < TC_OUTPUT_MAX)
+                g_string_append_len(s, buf, MIN((gsize)n, TC_OUTPUT_MAX - s->len));
+            continue;
+        }
+        if (n == 0 || errno != EINTR)
+            break;
     }
     return g_string_free(s, FALSE);
 }
 
 /* Largest batch we will hand to tc in one write. The whole batch is written
  * before the child's output is read, so it has to fit in the pipe buffer
- * (64 KiB on Linux) or writer and reader could deadlock. LAG_MAX_RULES rules
- * come to well under this; the check is here so that stops being true loudly
- * rather than by hanging. */
-#define TC_BATCH_MAX 32768
+ * (64 KiB on Linux) or writer and reader could deadlock.
+ *
+ * A full profile stays inside this: the longest a rule can contribute is its
+ * class + netem + filter lines with every field at its maximum
+ * (LAG_IFACE_LEN-1 interface, two LAG_IP_LEN-1 addresses, two 5-digit ports,
+ * a LAG_BW_LEN-1 rate), which is 640 bytes, so LAG_MAX_RULES rules cannot
+ * exceed 40 KiB. The check is the backstop for a future field or rule-count
+ * change: it fails the apply loudly instead of hanging on a full pipe. */
+#define TC_BATCH_MAX 49152
 
 /* Run several tc commands in a single privileged process.
  *
@@ -253,9 +270,9 @@ int tc_run_batch(const char *const *lines, int n, char *out, size_t outlen) {
     const char *w = batch->str;
     gsize left = batch->len;
     while (left > 0) {
-        ssize_t n = write(in_fd, w, left);
-        if (n > 0) { w += n; left -= (gsize)n; continue; }
-        if (n < 0 && errno == EINTR) continue;
+        ssize_t written = write(in_fd, w, left);
+        if (written > 0) { w += written; left -= (gsize)written; continue; }
+        if (written < 0 && errno == EINTR) continue;
         break;                              /* child gone: its status tells us */
     }
     close(in_fd);
