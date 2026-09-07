@@ -1,0 +1,11 @@
+# Build artifacts. These are exactly what `make clean` removes; they are
+# rebuilt from source by `make` and `make test`, so they do not belong in
+# the history (every rebuild would otherwise show up as binary churn).
+/testlag
+src/*.o
+/test/test_tc
+/test/test_sudo
+/test/test_askpass
+/test/test_ui
+
+/src/resources.c
