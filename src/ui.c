@@ -57,7 +57,70 @@ static void fmt_ms(char *buf, size_t n, double v) {
         g_snprintf(buf, n, "%g ms", v);
 }
 
+typedef struct {
+    gboolean following;
+    gboolean updating;
+    gboolean restoring;
+    double position;
+    guint idle;
+} OutputScroll;
+
+static void restore_output_scroll(GtkAdjustment *adjustment, GtkWidget *view) {
+    OutputScroll *scroll = g_object_get_data(G_OBJECT(view), "output-scroll");
+    double bottom = MAX(gtk_adjustment_get_lower(adjustment),
+                        gtk_adjustment_get_upper(adjustment) -
+                        gtk_adjustment_get_page_size(adjustment));
+    scroll->restoring = TRUE;
+    gtk_adjustment_set_value(adjustment,
+                            scroll->following ? bottom : MIN(scroll->position, bottom));
+    scroll->restoring = FALSE;
+}
+
+static void output_scroll_moved(GtkAdjustment *adjustment, GtkWidget *view) {
+    OutputScroll *scroll = g_object_get_data(G_OBJECT(view), "output-scroll");
+    if (scroll->updating || scroll->restoring) return;
+    scroll->position = gtk_adjustment_get_value(adjustment);
+    scroll->following = scroll->position >=
+        gtk_adjustment_get_upper(adjustment) -
+        gtk_adjustment_get_page_size(adjustment) - 1.0;
+}
+
+static gboolean finish_output_update(gpointer data) {
+    GtkWidget *view = data;
+    OutputScroll *scroll = g_object_get_data(G_OBJECT(view), "output-scroll");
+    /* Validate the new text before restoring the adjustment, avoiding a
+     * scroll against the previous layout followed by another jump. */
+    GtkTextIter end;
+    GdkRectangle rect;
+    gtk_text_buffer_get_end_iter(gtk_text_view_get_buffer(GTK_TEXT_VIEW(view)), &end);
+    gtk_text_view_get_iter_location(GTK_TEXT_VIEW(view), &end, &rect);
+    restore_output_scroll(gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(view)), view);
+    scroll->updating = FALSE;
+    scroll->idle = 0;
+    return G_SOURCE_REMOVE;
+}
+
+static void begin_output_update(GtkWidget *view) {
+    OutputScroll *scroll = g_object_get_data(G_OBJECT(view), "output-scroll");
+    if (!scroll) {
+        scroll = g_new0(OutputScroll, 1);
+        scroll->following = TRUE;
+        g_object_set_data_full(G_OBJECT(view), "output-scroll", scroll, g_free);
+        GtkAdjustment *adjustment = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(view));
+        g_signal_connect_object(adjustment, "changed",
+                                G_CALLBACK(restore_output_scroll), view, 0);
+        g_signal_connect_object(adjustment, "value-changed",
+                                G_CALLBACK(output_scroll_moved), view, 0);
+        output_scroll_moved(adjustment, view);
+    }
+    scroll->updating = TRUE;
+    if (!scroll->idle)
+        scroll->idle = g_idle_add_full(G_PRIORITY_LOW, finish_output_update,
+                                      g_object_ref(view), g_object_unref);
+}
+
 static void ui_log(UI *ui, const char *fmt, ...) {
+    begin_output_update(ui->log_view);
     GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ui->log_view));
     time_t t = time(NULL);
     struct tm tm;
@@ -82,13 +145,16 @@ static void ui_log(UI *ui, const char *fmt, ...) {
     gtk_text_buffer_get_bounds(buf, &start, &end);
     gint nchars = gtk_text_iter_get_offset(&end);
     if (nchars > 20000) {
-        gtk_text_iter_set_offset(&start, nchars - 20000);
+        gtk_text_iter_set_offset(&end, nchars - 20000);
+        OutputScroll *scroll = g_object_get_data(G_OBJECT(ui->log_view), "output-scroll");
+        if (!scroll->following) {
+            GdkRectangle first, retained;
+            gtk_text_view_get_iter_location(GTK_TEXT_VIEW(ui->log_view), &start, &first);
+            gtk_text_view_get_iter_location(GTK_TEXT_VIEW(ui->log_view), &end, &retained);
+            scroll->position = MAX(0.0, scroll->position - (retained.y - first.y));
+        }
         gtk_text_buffer_delete(buf, &start, &end);
     }
-    gtk_text_buffer_get_end_iter(buf, &end);
-    GtkTextMark *mark = gtk_text_buffer_create_mark(buf, NULL, &end, FALSE);
-    gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(ui->log_view), mark, 0.0, TRUE, 0, 0);
-    gtk_text_buffer_delete_mark(buf, mark);
 }
 
 static void show_error(UI *ui, const char *title, const char *msg) {
@@ -307,7 +373,14 @@ static void refresh_state_now(UI *ui) {
     if (s->len == 0)
         g_string_append(s, "(no rules defined)\n");
     GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ui->state_view));
-    gtk_text_buffer_set_text(buf, s->str, -1);
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds(buf, &start, &end);
+    char *previous = gtk_text_buffer_get_text(buf, &start, &end, FALSE);
+    if (strcmp(previous, s->str) != 0) {
+        begin_output_update(ui->state_view);
+        gtk_text_buffer_set_text(buf, s->str, -1);
+    }
+    g_free(previous);
     g_string_free(s, TRUE);
 }
 

@@ -6,6 +6,7 @@ static int calls[4];
 static const char *fail_iface;
 static gboolean fail_once;
 static LagProfile applied[4];
+static const char *state_text = "";
 
 int __wrap_tc_apply_interface(LagProfile *p, const char *iface, char *err, size_t n) {
     int slot = strcmp(iface, "lo") == 0 ? 0 : iface[4] - '0';
@@ -23,7 +24,7 @@ int __wrap_tc_apply_interface(LagProfile *p, const char *iface, char *err, size_
 
 char *__wrap_tc_get_state_text(const char *iface) {
     (void)iface;
-    return g_strdup("");
+    return g_strdup(state_text);
 }
 
 static gboolean dismiss_errors(gpointer data) {
@@ -58,8 +59,88 @@ static void reset(UI *ui) {
     ui_refresh_list(ui);
 }
 
+static void settle_output(void) {
+    /* Include frame-clock layout and deferred scrolling. */
+    gint64 until = g_get_monotonic_time() + 100000;
+    do {
+        while (g_main_context_iteration(NULL, FALSE)) {}
+        g_usleep(1000);
+    } while (g_get_monotonic_time() < until);
+}
+
+static void assert_at_bottom(GtkAdjustment *adjustment) {
+    g_assert_cmpfloat_with_epsilon(gtk_adjustment_get_value(adjustment),
+        gtk_adjustment_get_upper(adjustment) - gtk_adjustment_get_page_size(adjustment), 1.0);
+}
+
+static void test_output_scrolling(void) {
+    LagProfile profile = {.count = 1};
+    g_strlcpy(profile.rules[0].iface, "lo", LAG_IFACE_LEN);
+    UI ui = {.profile = &profile};
+    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(window), box);
+    ui.log_view = gtk_text_view_new();
+    ui.state_view = gtk_text_view_new();
+    GtkWidget *views[] = {ui.log_view, ui.state_view};
+    for (int i = 0; i < 2; i++) {
+        GtkWidget *scroller = gtk_scrolled_window_new(NULL, NULL);
+        gtk_widget_set_size_request(scroller, 400, 120);
+        gtk_container_add(GTK_CONTAINER(scroller), views[i]);
+        gtk_box_pack_start(GTK_BOX(box), scroller, TRUE, TRUE, 0);
+    }
+    gtk_widget_show_all(window);
+    settle_output();
+    GString *text = g_string_new("");
+    for (int i = 0; i < 100; i++) g_string_append_printf(text, "Output line %d\n", i);
+    state_text = text->str;
+    ui_log(&ui, "%s", text->str);
+    refresh_state_now(&ui);
+    settle_output();
+    for (int i = 0; i < 2; i++) {
+        GtkAdjustment *adj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(views[i]));
+        assert_at_bottom(adj);
+        gtk_adjustment_set_value(adj, 100);
+    }
+    g_string_prepend(text, "Updated state\n");
+    state_text = text->str;
+    ui_log(&ui, "New entry while reading history");
+    refresh_state_now(&ui);
+    settle_output();
+    for (int i = 0; i < 2; i++) {
+        GtkAdjustment *adj = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(views[i]));
+        g_assert_cmpfloat_with_epsilon(gtk_adjustment_get_value(adj), 100, 1.0);
+        gtk_adjustment_set_value(adj, gtk_adjustment_get_upper(adj) -
+                                      gtk_adjustment_get_page_size(adj));
+    }
+    g_string_append(text, "Latest state\n");
+    state_text = text->str;
+    ui_log(&ui, "Latest log entry");
+    refresh_state_now(&ui);
+    settle_output();
+    for (int i = 0; i < 2; i++)
+        assert_at_bottom(gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(views[i])));
+    /* Crossing the retention limit must keep the newest entry and tail it. */
+    for (int i = 0; i < 20; i++) ui_log(&ui, "%s", text->str);
+    ui_log(&ui, "Newest retained entry");
+    settle_output();
+    assert_at_bottom(gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(ui.log_view)));
+    GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ui.log_view));
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds(buf, &start, &end);
+    char *retained = gtk_text_buffer_get_text(buf, &start, &end, FALSE);
+    g_assert_nonnull(strstr(retained, "Newest retained entry"));
+    g_assert_cmpint(gtk_text_buffer_get_char_count(buf), <=, 20000);
+    g_free(retained);
+    state_text = "";
+    g_string_free(text, TRUE);
+    gtk_widget_destroy(window);
+    settle_output();
+}
+
 int main(int argc, char **argv) {
     gtk_init(&argc, &argv);
+    test_output_scrolling();
     LagProfile profile;
     UI ui = {.profile = &profile};
     memset(&profile, 0, sizeof profile);
