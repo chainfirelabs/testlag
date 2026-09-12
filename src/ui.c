@@ -389,6 +389,74 @@ static gboolean refresh_state_timer(gpointer data) {
     return G_SOURCE_CONTINUE;
 }
 
+/* tc writes may spend a long time waiting for sudo authentication.  Running
+ * them in a GTK callback would stop the main loop, causing the compositor to
+ * report TestLag as unresponsive while sudo retries a bad password.
+ *
+ * Keep dispatching the main context while a worker performs the blocking
+ * backend call.  The window is insensitive meanwhile, so no action can mutate
+ * the profile or start another tc operation.  The periodic state query is
+ * paused for the same reason.  Only the copied profile and this job are
+ * touched by the worker; all GTK work remains on the main thread. */
+typedef struct {
+    LagProfile profile;
+    char iface[LAG_IFACE_LEN];
+    char *err;
+    size_t errlen;
+    int status;
+    gint done;
+} ApplyJob;
+
+static gboolean apply_job_finished(gpointer data) {
+    ApplyJob *job = data;
+    g_atomic_int_set(&job->done, TRUE);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer apply_job_worker(gpointer data) {
+    ApplyJob *job = data;
+    job->status = tc_apply_interface(&job->profile, job->iface,
+                                     job->err, job->errlen);
+
+    /* Attach an idle source instead of touching GTK from this thread. */
+    GSource *done = g_idle_source_new();
+    g_source_set_callback(done, apply_job_finished, job, NULL);
+    g_source_attach(done, NULL);
+    g_source_unref(done);
+    return NULL;
+}
+
+static int apply_interface_responsive(UI *ui, const char *iface,
+                                      char *err, size_t errlen) {
+    ApplyJob job = {
+        .profile = *ui->profile,
+        .err = err,
+        .errlen = errlen,
+        .status = -1,
+        .done = FALSE,
+    };
+    g_strlcpy(job.iface, iface, sizeof job.iface);
+
+    gboolean restart_timer = ui->state_timer != 0;
+    if (restart_timer) {
+        g_source_remove(ui->state_timer);
+        ui->state_timer = 0;
+    }
+    gtk_widget_set_sensitive(ui->window, FALSE);
+
+    GThread *worker = g_thread_new("testlag-tc", apply_job_worker, &job);
+    /* Checking the flag before every iteration also covers a backend call
+     * that completes before we begin dispatching the idle source. */
+    while (!g_atomic_int_get(&job.done))
+        g_main_context_iteration(NULL, TRUE);
+    g_thread_join(worker);
+
+    gtk_widget_set_sensitive(ui->window, TRUE);
+    if (restart_timer)
+        ui->state_timer = g_timeout_add(2000, refresh_state_timer, ui);
+    return job.status;
+}
+
 static void on_add_clicked(GtkButton *b, gpointer data) {
     (void)b;
     UI *ui = data;
@@ -432,8 +500,8 @@ static void on_edit_clicked(GtkButton *b, gpointer data) {
     if (r.active) {
         char e2[2048];
         if (g_strcmp0(old_iface, r.iface) != 0)
-            tc_apply_interface(ui->profile, old_iface, e2, sizeof e2);
-        if (tc_apply_interface(ui->profile, r.iface, e2, sizeof e2) != 0) {
+            apply_interface_responsive(ui, old_iface, e2, sizeof e2);
+        if (apply_interface_responsive(ui, r.iface, e2, sizeof e2) != 0) {
             ui->profile->rules[idx].active = FALSE;
             show_error(ui, "Edit failed (rule deactivated)", e2);
         } else {
@@ -475,7 +543,7 @@ static int start_stop_rules(UI *ui, const gboolean *selected, gboolean start) {
     for (guint k = 0; k < ifs->len; k++) {
         const char *iface = g_ptr_array_index(ifs, k);
         char err[2048];
-        if (tc_apply_interface(ui->profile, iface, err, sizeof err) == 0) {
+        if (apply_interface_responsive(ui, iface, err, sizeof err) == 0) {
             ui_log(ui, "%s %s rules on %s", start ? "Started" : "Stopped",
                    selected ? "selected" : "all", iface);
             continue;
@@ -492,7 +560,7 @@ static int start_stop_rules(UI *ui, const gboolean *selected, gboolean start) {
            a failure here leaves the rules that were already running alone. */
         restore_iface_flags(ui, iface, saved);
         char rerr[2048];
-        if (tc_apply_interface(ui->profile, iface, rerr, sizeof rerr) != 0)
+        if (apply_interface_responsive(ui, iface, rerr, sizeof rerr) != 0)
             ui_log(ui, "WARNING: could not restore %s: %s", iface, rerr);
         show_error(ui, "Start failed", err);
     }
