@@ -16,12 +16,13 @@
  * netem "rate" option is the actual bandwidth limiter. */
 #define LAG_CLASS_RATE  "100gbit"
 
-typedef enum { LAG_OUTGOING, LAG_INCOMING } LagDirection;
+typedef enum { LAG_OUTGOING, LAG_INCOMING, LAG_BOTH } LagDirection;
 typedef enum { LAG_ANY, LAG_TCP, LAG_UDP, LAG_SCTP, LAG_ICMP, LAG_ICMPV6 } LagProtocol;
 
 static inline const char *lag_direction_name(LagDirection direction) {
     return direction == LAG_OUTGOING ? "outgoing" :
-           direction == LAG_INCOMING ? "incoming" : "invalid";
+           direction == LAG_INCOMING ? "incoming" :
+           direction == LAG_BOTH ? "both" : "invalid";
 }
 static inline const char *lag_protocol_name(LagProtocol protocol) {
     static const char *names[] = {"any", "tcp", "udp", "sctp", "icmp", "icmpv6"};

@@ -351,7 +351,7 @@ gboolean tc_parse_protocol(const char *s, LagProtocol *protocol) {
 }
 
 gboolean tc_parse_direction(const char *s, LagDirection *direction) {
-    for (int i = LAG_OUTGOING; i <= LAG_INCOMING; i++)
+    for (int i = LAG_OUTGOING; i <= LAG_BOTH; i++)
         if (g_strcmp0(s, lag_direction_name(i)) == 0) { *direction = i; return TRUE; }
     return FALSE;
 }
@@ -435,7 +435,7 @@ gboolean tc_valid_rule(const LagRule *r, char *err, size_t errlen) {
         return rule_err(err, errlen, "invalid source port: %s", r->src_port);
     if (r->dst_port[0] && !tc_valid_port(r->dst_port))
         return rule_err(err, errlen, "invalid destination port: %s", r->dst_port);
-    if (r->direction < LAG_OUTGOING || r->direction > LAG_INCOMING)
+    if (r->direction < LAG_OUTGOING || r->direction > LAG_BOTH)
         return rule_err(err, errlen, "invalid direction");
     if (r->protocol < LAG_ANY || r->protocol > LAG_ICMPV6)
         return rule_err(err, errlen, "invalid protocol");
@@ -547,6 +547,26 @@ int tc_check_interface(const char *iface, char *err, size_t errlen) {
     return check_interface_state(iface, NULL, err, errlen);
 }
 
+/* Standalone runs cannot reconstruct another process's rules on exit. */
+int tc_check_standalone(const char *iface, char *err, size_t errlen) {
+    gboolean teardown = FALSE;
+    if (check_interface_state(iface, &teardown, err, errlen) != 0) return -1;
+    char cmd[256], out[8192], ifb[IFNAMSIZ];
+    g_snprintf(cmd, sizeof cmd, "tc qdisc show dev %s", iface);
+    if (tc_run(cmd, FALSE, out, sizeof out) != 0) {
+        g_snprintf(err, errlen, "Cannot inspect %s: %s", iface, out);
+        return -1;
+    }
+    if (teardown || strstr(out, "qdisc htb ") ||
+        strstr(out, "qdisc ingress ") || strstr(out, "qdisc clsact ") ||
+        (tc_ifb_name(iface, ifb, sizeof ifb) && if_nametoindex(ifb))) {
+        g_snprintf(err, errlen,
+            "Interface %s is already managed; stop its rules before using run", iface);
+        return -1;
+    }
+    return 0;
+}
+
 gboolean tc_ifb_name(const char *iface, char *name, size_t len) {
     if (!tc_valid_iface(iface)) return FALSE;
     unsigned int index = if_nametoindex(iface);
@@ -644,7 +664,8 @@ int tc_sync_active_state(LagProfile *p) {
         for (int i = 0; i < p->count; i++) {
             LagRule *r = &p->rules[i];
             if (!r->active || g_strcmp0(r->iface, iface) != 0) continue;
-            if (r->direction == LAG_INCOMING ? incoming : outgoing) continue;
+            if (r->direction == LAG_BOTH ? (incoming && outgoing) :
+                r->direction == LAG_INCOMING ? incoming : outgoing) continue;
             r->active = FALSE;
             cleared++;
         }
@@ -1010,12 +1031,25 @@ int tc_apply_interface(LagProfile *p, const char *iface, char *err, size_t errle
         const LagRule *r = &p->rules[i];
         if (!r->active || strcmp(r->iface, iface) != 0) continue;
         if (!tc_valid_rule(r, err, errlen)) return -1;
-        if (lag_rule_is_all(r) && ++all[r->direction] > 1) {
-            g_snprintf(err, errlen, "Only one all-traffic rule per direction may be active on %s", iface);
-            return -1;
+        for (int direction = LAG_OUTGOING; direction <= LAG_INCOMING; direction++) {
+            if (r->direction != LAG_BOTH && r->direction != (LagDirection)direction)
+                continue;
+            if (lag_rule_is_all(r) && ++all[direction] > 1) {
+                g_snprintf(err, errlen, "Only one all-traffic rule per direction may be active on %s", iface);
+                return -1;
+            }
+            LagProfile *target = direction == LAG_INCOMING ? &incoming : &outgoing;
+            LagRule *expanded = &target->rules[target->count++];
+            *expanded = *r;
+            expanded->direction = direction;
+            /* Both describes an outgoing flow and its reverse incoming flow. */
+            if (r->direction == LAG_BOTH && direction == LAG_INCOMING) {
+                g_strlcpy(expanded->src_ip, r->dst_ip, sizeof expanded->src_ip);
+                g_strlcpy(expanded->dst_ip, r->src_ip, sizeof expanded->dst_ip);
+                g_strlcpy(expanded->src_port, r->dst_port, sizeof expanded->src_port);
+                g_strlcpy(expanded->dst_port, r->src_port, sizeof expanded->dst_port);
+            }
         }
-        LagProfile *target = r->direction == LAG_INCOMING ? &incoming : &outgoing;
-        target->rules[target->count++] = *r;
     }
     if (incoming.count && !have_ifb_name) {
         g_snprintf(err, errlen, "Interface %s does not exist", iface);

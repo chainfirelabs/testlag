@@ -210,7 +210,8 @@ static void ui_refresh_list(UI *ui) {
         g_snprintf(drop, sizeof drop, "%g%%", r->drop_pct);
         gtk_list_store_set(ui->store, &it,
             COL_IFACE,  r->iface,
-            COL_DIRECTION, r->direction == LAG_INCOMING ? "Incoming" : "Outgoing",
+            COL_DIRECTION, r->direction == LAG_BOTH ? "Both" :
+                           r->direction == LAG_INCOMING ? "Incoming" : "Outgoing",
             COL_PROTOCOL, lag_protocol_name(r->protocol),
             COL_SRC_IP,   r->src_ip[0]   ? r->src_ip   : "(all)",
             COL_SRC_PORT, r->src_port[0] ? r->src_port : "(all)",
@@ -856,6 +857,7 @@ static void build_form(UI *ui, GtkWidget *vbox) {
     ui->direction_combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ui->direction_combo), "Outgoing");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ui->direction_combo), "Incoming");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(ui->direction_combo), "Both");
     gtk_combo_box_set_active(GTK_COMBO_BOX(ui->direction_combo), LAG_OUTGOING);
     ui->protocol_combo = gtk_combo_box_text_new();
     for (int proto = LAG_ANY; proto <= LAG_ICMPV6; proto++)

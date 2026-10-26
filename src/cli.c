@@ -21,6 +21,8 @@
 #include "profile.h"
 #include "tc.h"
 
+#include <signal.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +36,7 @@ static void cli_usage(FILE *out) {
         "Commands:\n"
         "  list                            List rules in the profile\n"
         "  ifaces                          List available network interfaces\n"
+        "  run --iface IFACE [rule opts]   Run until Ctrl+C; never save a profile\n"
         "  add --iface IFACE [rule opts]   Add a rule (saved to the profile)\n"
         "  edit N [rule opts]              Update rule N (unspecified fields unchanged)\n"
         "  del N                           Delete rule N (stops it first if active)\n"
@@ -42,8 +45,8 @@ static void cli_usage(FILE *out) {
         "  status                          Show live tc state for profile interfaces\n"
         "  help                            Show this help\n"
         "\n"
-        "Rule options (source/destination refer to the packet endpoints):\n"
-        "  --direction DIR   outgoing (default) or incoming\n"
+        "Rule options (both reverses outgoing endpoints for incoming traffic):\n"
+        "  --direction DIR   outgoing (default), incoming, or both\n"
         "  --protocol PROTO  any (default), tcp, udp, sctp, icmp, icmpv6\n"
         "  --iface IFACE     Network interface (required for add; e.g. lo, eth0)\n"
         "  --src-ip IP       Source IP or CIDR subnet (default: any)\n"
@@ -70,7 +73,7 @@ static void cli_usage(FILE *out) {
 }
 
 gboolean cli_is_command(const char *s) {
-    static const char *cmds[] = { "list", "add", "edit", "del", "delete",
+    static const char *cmds[] = { "list", "run", "add", "edit", "del", "delete",
                                   "start", "stop", "status", "ifaces",
                                   "help", NULL };
     for (int i = 0; cmds[i]; i++)
@@ -113,7 +116,7 @@ static int parse_rule_opts(char **argv, RuleOpts *o, char *err, size_t errlen) {
         if (g_strcmp0(a, "--direction") == 0) {
             i++;
             if (!tc_parse_direction(argv[i], &o->direction)) {
-                g_snprintf(err, errlen, "--direction must be outgoing or incoming"); return -1;
+                g_snprintf(err, errlen, "--direction must be outgoing, incoming, or both"); return -1;
             }
             o->has_direction = TRUE;
         } else if (g_strcmp0(a, "--protocol") == 0) {
@@ -266,6 +269,26 @@ static int cmd_ifaces(void) {
     return 0;
 }
 
+static int rule_from_opts(const RuleOpts *o, LagRule *r, char *err, size_t errlen) {
+    lag_rule_reset(r);
+    g_strlcpy(r->iface, o->iface, sizeof r->iface);
+    if (o->has_src_ip)   g_strlcpy(r->src_ip, o->src_ip, sizeof r->src_ip);
+    if (o->has_src_port) g_strlcpy(r->src_port, o->src_port, sizeof r->src_port);
+    if (o->has_dst_ip)   g_strlcpy(r->dst_ip, o->dst_ip, sizeof r->dst_ip);
+    if (o->has_dst_port) g_strlcpy(r->dst_port, o->dst_port, sizeof r->dst_port);
+    if (o->has_bw)   g_strlcpy(r->bandwidth, o->bw, sizeof r->bandwidth);
+    if (o->has_lat)  r->latency_ms = o->lat;
+    if (o->has_jit)  r->jitter_ms  = o->jit;
+    if (o->has_drop) r->drop_pct   = o->drop;
+    if (o->has_direction) r->direction = o->direction;
+    if (o->has_protocol) r->protocol = o->protocol;
+    if (!tc_valid_rule(r, err, errlen)) {
+        return -1;
+    }
+
+    return 0;
+}
+
 static int cmd_add(LagProfile *p, const char *path, char **argv) {
     if (p->count >= LAG_MAX_RULES) {
         fprintf(stderr, "error: profile is full (%d rules)\n", LAG_MAX_RULES);
@@ -283,20 +306,9 @@ static int cmd_add(LagProfile *p, const char *path, char **argv) {
         return 1;
     }
     LagRule r;
-    lag_rule_reset(&r);
-    g_strlcpy(r.iface, o.iface, sizeof r.iface);
-    if (o.has_src_ip)   g_strlcpy(r.src_ip, o.src_ip, sizeof r.src_ip);
-    if (o.has_src_port) g_strlcpy(r.src_port, o.src_port, sizeof r.src_port);
-    if (o.has_dst_ip)   g_strlcpy(r.dst_ip, o.dst_ip, sizeof r.dst_ip);
-    if (o.has_dst_port) g_strlcpy(r.dst_port, o.dst_port, sizeof r.dst_port);
-    if (o.has_bw)   g_strlcpy(r.bandwidth, o.bw, sizeof r.bandwidth);
-    if (o.has_lat)  r.latency_ms = o.lat;
-    if (o.has_jit)  r.jitter_ms  = o.jit;
-    if (o.has_drop) r.drop_pct   = o.drop;
-    if (o.has_direction) r.direction = o.direction;
-    if (o.has_protocol) r.protocol = o.protocol;
-    if (!tc_valid_rule(&r, err, sizeof err)) {
-        fprintf(stderr, "error: %s\n", err); return 1;
+    if (rule_from_opts(&o, &r, err, sizeof err) != 0) {
+        fprintf(stderr, "error: %s\n", err);
+        return 1;
     }
 
     int idx = p->count;
@@ -321,6 +333,65 @@ static int cmd_add(LagProfile *p, const char *path, char **argv) {
         printf("started rule %d on %s\n", idx, rr->iface);
     }
     return 0;
+}
+
+/* The handler only sets a flag; tc cleanup runs in normal process context. */
+static volatile sig_atomic_t run_signal;
+static void run_stop(int signo) { run_signal = signo; }
+
+static int cmd_run(char **argv) {
+    RuleOpts o = {0};
+    char err[2048];
+    LagProfile p = {0};
+    if (parse_rule_opts(argv, &o, err, sizeof err) != 0) {
+        fprintf(stderr, "error: %s\n", err);
+        return 1;
+    }
+    if (!o.has_iface || o.active) {
+        fprintf(stderr, "error: run requires --iface and does not accept --active\n");
+        return 1;
+    }
+    if (rule_from_opts(&o, &p.rules[0], err, sizeof err) != 0 ||
+        tc_check_standalone(o.iface, err, sizeof err) != 0) {
+        fprintf(stderr, "error: %s\n", err);
+        return 1;
+    }
+    struct sigaction action = {0}, old[3];
+    const int signals[] = {SIGINT, SIGTERM, SIGHUP};
+    action.sa_handler = run_stop;
+    sigemptyset(&action.sa_mask);
+    run_signal = 0;
+    int installed = 0;
+    for (; installed < 3; installed++) {
+        if (sigaction(signals[installed], &action, &old[installed]) != 0) {
+            perror("sigaction");
+            while (installed--) sigaction(signals[installed], &old[installed], NULL);
+            return 1;
+        }
+    }
+    p.count = 1;
+    p.rules[0].active = TRUE;
+    int rc = 0;
+    if (!run_signal) {
+        if (tc_apply_interface(&p, o.iface, err, sizeof err) != 0) {
+            fprintf(stderr, "error: start failed: %s\n", err);
+            rc = 1;
+        } else {
+            printf("Running standalone on %s; press Ctrl+C to stop.\n", o.iface);
+            fflush(stdout);
+            while (!run_signal) {
+                struct timespec interval = {0, 100000000};
+                nanosleep(&interval, NULL);
+            }
+        }
+        /* Also clean up a partially applied tree after startup failure. */
+        if (tc_clear_interface(o.iface, err, sizeof err) != 0) {
+            fprintf(stderr, "error: cleanup failed: %s\n", err);
+            rc = 1;
+        }
+    }
+    for (int i = 0; i < 3; i++) sigaction(signals[i], &old[i], NULL);
+    return rc ? rc : run_signal ? 128 + run_signal : 0;
 }
 
 static int cmd_edit(LagProfile *p, const char *path, int idx, char **argv) {
@@ -569,6 +640,8 @@ int cli_main(char **argv, LagProfile *profile, const char *profile_path) {
     const char *cmd = argv[0];
     char **opts = argv + 1;
 
+    if (g_strcmp0(cmd, "run") == 0)
+        return cmd_run(opts);
     if (g_strcmp0(cmd, "list") == 0) {
         if (opts[0]) {
             fprintf(stderr, "error: list takes no arguments\n");

@@ -82,6 +82,7 @@ sudo ./testlag                     # run the whole app as root
 CLI commands:
 
 ```sh
+testlag run --iface IFACE [rule opts] # foreground scenario; no profile
 testlag list                 # list rules (index, iface, match, effects, state)
 testlag ifaces               # list available network interfaces
 testlag add --iface IFACE [rule opts]
@@ -93,11 +94,29 @@ testlag status               # show live tc state
 testlag help                 # show full option list
 ```
 
-Rule options for `add`/`edit`:
+For a standalone scenario without loading or saving a profile:
+
+```sh
+sudo ./testlag run --iface eth0 --latency 300
+sudo ./testlag run --iface eth0 --protocol tcp --dst-port 443 --latency 150 --jitter 30
+```
+
+`run` stays in the foreground and removes its traffic shaping when it receives
+Ctrl+C (SIGINT), SIGTERM (ordinary `kill`), or SIGHUP. It accepts the same rule
+options as `add`, except `--active`: the scenario starts immediately. The
+interface must have no existing TestLag rules, custom root qdisc, or ingress
+setup; stop those rules before running a standalone scenario. Other interfaces
+can continue running profile rules. Avoid changing rules on the standalone
+interface from another process while `run` is active.
+
+SIGKILL (`kill -9`), a crash, or power loss cannot trigger process cleanup.
+After SIGKILL or a crash, remove leftover shaping before reusing the interface.
+
+Rule options for `add`/`edit`/`run`:
 
 ```
 --iface IFACE       interface (required for add; e.g. lo, eth0)
---direction DIR     outgoing (default) or incoming
+--direction DIR     outgoing (default), incoming, or both
 --protocol PROTO    any (default), tcp, udp, sctp, icmp, icmpv6
 --src-ip IP         source IP or CIDR (default: any)
 --src-port PORT     source port (default: any)
@@ -115,6 +134,21 @@ server" matches the replies it sends (`--src-port 80`). Use
 `--direction incoming` for the other side. If a rule seems to do nothing,
 check `ip route get <ip>` — `local ... dev lo` means the traffic never leaves
 the machine, and the rule belongs on `lo`.
+
+Use `--direction both` to delay an outgoing flow and its incoming reverse flow:
+
+```sh
+sudo ./testlag run --iface eth0 --direction both --dst-ip 192.168.1.1 --latency 100
+```
+
+This adds 100 ms to packets sent to `192.168.1.1` and 100 ms to packets
+received from it (roughly 200 ms extra round-trip latency). For `both`, specify
+source/destination IPs and ports as they appear on outgoing packets; TestLag
+swaps source and destination for the incoming match. Protocol and effects apply
+to both directions. The same option works with `add`/`edit` and profiles, and
+**Both** is available in the GUI. Without endpoint filters, it affects all
+traffic in both directions. Explicit `incoming` rules retain their usual
+packet source/destination semantics.
 
 Closing the GUI stops every active rule before quitting; the rules stay in the
 profile and can be started again next launch.

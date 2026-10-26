@@ -33,6 +33,9 @@ int tc_run_batch(const char *const *lines, int n, char *out, size_t outlen);
 GPtrArray *tc_list_interfaces(void);
 
 /* 0 if iface can be managed (root absent/noqueue, or our htb), else -1 + err. */
+/* Require an unused interface for a standalone run. */
+int tc_check_standalone(const char *iface, char *err, size_t errlen);
+
 int tc_check_interface(const char *iface, char *err, size_t errlen);
 
 /* Rebuild the iface qdisc tree from all active rules in *p.

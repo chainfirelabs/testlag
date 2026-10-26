@@ -10,3 +10,4 @@ src/*.o
 /test/test_ui
 
 /src/resources.c
+examples/

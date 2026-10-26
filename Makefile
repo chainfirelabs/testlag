@@ -55,10 +55,13 @@ test-run: test
 	./test/test_sudo
 	unshare -r -n ./test/test_tc
 
+test-standalone: testlag
+	unshare -r -n python3 test/test_run.py
+
 test-ingress: testlag
 	unshare -r -n python3 test/test_ingress.py
 
 clean:
 	rm -f testlag $(OBJ) src/resources.c test/test_tc test/test_sudo test/test_askpass test/test_ui
 
-.PHONY: all test test-run test-gui test-ingress clean
+.PHONY: all test test-run test-gui test-ingress test-standalone clean

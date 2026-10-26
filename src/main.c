@@ -26,7 +26,7 @@ static void usage(const char *prog) {
         "                 (default: ~/.config/testlag/profile.json)\n"
         "  -h, --help     Show this help\n"
         "\n"
-        "CLI commands: list, add, edit, del, start, stop, status, ifaces, help\n"
+        "CLI commands: list, run, add, edit, del, start, stop, status, ifaces, help\n"
         "  See '%s help' for command details.\n"
         "\n"
         "GUI actions show a password dialog; CLI actions prompt in the terminal.\n",
@@ -77,7 +77,8 @@ int main(int argc, char **argv) {
 
     LagProfile *profile = g_new0(LagProfile, 1);
     profile_clear(profile);
-    if (g_file_test(profile_path, G_FILE_TEST_EXISTS)) {
+    if (!(cli_argv && g_strcmp0(cli_argv[0], "run") == 0) &&
+        g_file_test(profile_path, G_FILE_TEST_EXISTS)) {
         char err[512];
         if (profile_load(profile, profile_path, err, sizeof err) != 0)
             g_warning("Could not load profile %s: %s", profile_path, err);
